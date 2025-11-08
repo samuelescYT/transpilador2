@@ -62,14 +62,26 @@ export default function CapiTraduce() {
     setProcessing(false);
   }
 
+  function readFileAsText(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+      reader.onerror = () =>
+        reject(
+          reader.error || new Error("No se pudo leer el archivo seleccionado.")
+        );
+      reader.readAsText(file);
+    });
+  }
+
   async function handleFileUpload(event) {
-    const file = event.target.files?.[0];
+    const file = event.target.files && event.target.files.length ? event.target.files[0] : null;
     if (!file) {
       return;
     }
 
     try {
-      const text = await file.text();
+      const text = await readFileAsText(file);
       setUploadedFileName(file.name);
       setPythonCode(text);
       await transpilar(text);
