@@ -123,19 +123,23 @@ export default function CapiTraduce() {
 
         {/* Barra de controles */}
         <div className="flex flex-wrap justify-center gap-4 mb-6">
-          <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/70 px-4 py-2 text-gray-700 shadow-sm transition hover:shadow-md">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".py,.txt"
+            className="hidden"
+            onChange={handleFileUpload}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+            className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/70 px-4 py-2 text-gray-700 shadow-sm transition hover:shadow-md"
+          >
             <span className="text-sm font-medium">📂 Archivo</span>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".py,.txt"
-              className="hidden"
-              onChange={handleFileUpload}
-            />
             <span className="text-xs text-slate-500 max-w-[12rem] truncate">
               {uploadedFileName || "Selecciona un archivo .py"}
             </span>
-          </label>
+          </button>
 
           <button
             onClick={handleDownload}
