@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import CodeEditor from "./components/CodeEditor.jsx";
 
 export default function CapiTraduce() {
@@ -6,23 +6,39 @@ export default function CapiTraduce() {
   const [javaCode, setJavaCode] = useState("// Aquí aparecerá el código Java transpilado");
   const [processing, setProcessing] = useState(false);
   const [feedback, setFeedback] = useState(null);
+  const [uploadedFileName, setUploadedFileName] = useState("");
+  const fileInputRef = useRef(null);
 
-  async function transpilar() {
+  async function transpilar(sourceOverride) {
+    const codeToSend =
+      typeof sourceOverride === "string" ? sourceOverride : pythonCode;
+
+    if (!codeToSend.trim()) {
+      setFeedback({
+        type: "warning",
+        message: "Agrega código Python para iniciar la traducción.",
+        details: [],
+      });
+      return;
+    }
+
     setProcessing(true);
     setFeedback(null);
     try {
       const res = await fetch("http://localhost:8080/api/transpile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: pythonCode }),
+        body: JSON.stringify({ code: codeToSend }),
       });
       const data = await res.json();
       if (!res.ok) {
         setJavaCode((prev) => prev || "// No se pudo generar código Java");
+        const issues = Array.isArray(data.issues) ? data.issues : [];
+        const warnings = Array.isArray(data.warnings) ? data.warnings : [];
         setFeedback({
           type: "error",
           message: data.error || "La transpilación no pudo completarse.",
-          details: [...(data.issues || []), ...(data.warnings || []), ...(data.details ? [data.details] : [])],
+          details: [...issues, ...warnings],
         });
       } else {
         setJavaCode(data.javaCode || "// El backend no devolvió código Java");
@@ -44,6 +60,30 @@ export default function CapiTraduce() {
       });
     }
     setProcessing(false);
+  }
+
+  async function handleFileUpload(event) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      setUploadedFileName(file.name);
+      setPythonCode(text);
+      await transpilar(text);
+    } catch (err) {
+      setFeedback({
+        type: "error",
+        message: "No se pudo leer el archivo seleccionado.",
+        details: [err.message],
+      });
+    } finally {
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
   }
 
   function handleDownload() {
@@ -85,7 +125,16 @@ export default function CapiTraduce() {
         <div className="flex flex-wrap justify-center gap-4 mb-6">
           <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/70 px-4 py-2 text-gray-700 shadow-sm transition hover:shadow-md">
             <span className="text-sm font-medium">📂 Archivo</span>
-            <input type="file" accept=".py" className="hidden" />
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".py,.txt"
+              className="hidden"
+              onChange={handleFileUpload}
+            />
+            <span className="text-xs text-slate-500 max-w-[12rem] truncate">
+              {uploadedFileName || "Selecciona un archivo .py"}
+            </span>
           </label>
 
           <button
@@ -125,7 +174,7 @@ export default function CapiTraduce() {
         ) : null}
 
         {/* Editores lado a lado */}
-        <div className="flex flex-col gap-6 md:flex-row">
+        <div className="flex flex-col gap-6 sm:flex-row">
           {/* Python */}
           <div className="flex-1 min-w-0">
             <h2 className="mb-3 text-center text-lg font-semibold text-slate-600">Código Python</h2>

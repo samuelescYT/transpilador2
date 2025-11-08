@@ -695,6 +695,35 @@ Código Python:
     return out.strip()
 
 
+def _summarize_ai_failure(exc: Exception) -> str:
+    """Devuelve un mensaje entendible para el usuario sin códigos HTTP crudos."""
+
+    lowered = str(exc).strip().lower()
+    if not lowered:
+        return "La traducción asistida por IA no está disponible en este momento."
+
+    keywords = ("openai", "api", "clave", "unauthorized", "401", "key")
+    if any(token in lowered for token in keywords):
+        return "La traducción asistida por IA no está disponible: revisa la clave y el modelo configurados."
+
+    return "La traducción asistida por IA encontró un error inesperado. Intenta nuevamente en unos minutos."
+
+
+def _attempt_ai_translation(py_code: str):
+    """Ejecuta la ruta IA y devuelve (java_code, analysis, warning)."""
+
+    if not OPENAI_API_KEY:
+        return None, None, None
+
+    try:
+        ai_code = ai_translate_python_to_java(py_code)
+    except Exception as exc:  # noqa: BLE001 - queremos capturar y resumir cualquier fallo
+        return None, None, _summarize_ai_failure(exc)
+
+    ai_analysis = _analyze_java_output(ai_code)
+    return ai_code, ai_analysis, None
+
+
 def _validate_with_javac(java_code: str) -> List[str]:
     """Compila el código generado para comprobar si es válido."""
 
@@ -833,74 +862,57 @@ def transpile():
         analysis = _analyze_java_output(java_code)
 
         if analysis["errors"]:
-            if OPENAI_API_KEY:
-                try:
-                    ai_code = ai_translate_python_to_java(code)
-                    ai_analysis = _analyze_java_output(ai_code)
-                    if ai_analysis["errors"]:
-                        return (
-                            jsonify(
-                                {
-                                    "error": "Ninguno de los motores pudo generar Java válido.",
-                                    "issues": ai_analysis["errors"],
-                                    "warnings": ai_analysis["warnings"],
-                                }
-                            ),
-                            422,
-                        )
-                    response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
-                    response.status_code = 200
-                    return response
-                except Exception as e2:
-                    return (
-                        jsonify(
-                            {
-                                "error": "Los motores AST e IA fallaron al generar un resultado confiable.",
-                                "details": str(e2),
-                                "issues": analysis["errors"],
-                                "warnings": analysis["warnings"],
-                            }
-                        ),
-                        422,
-                    )
+            ai_code, ai_analysis, ai_warning = _attempt_ai_translation(code)
+            if ai_code and ai_analysis and not ai_analysis["errors"]:
+                response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
+                response.status_code = 200
+                return response
 
-            return (
-                jsonify(
-                    {
-                        "error": "El código contiene construcciones que no se pudieron convertir de forma segura.",
-                        "issues": analysis["errors"],
-                        "warnings": analysis["warnings"],
-                    }
-                ),
-                422,
-            )
+            issues = list(analysis["errors"])
+            warnings = list(analysis["warnings"])
+
+            if ai_analysis:
+                issues.extend(ai_analysis.get("errors", []))
+                warnings.extend(ai_analysis.get("warnings", []))
+
+            if ai_warning:
+                warnings.append(ai_warning)
+
+            error_message = "El código contiene construcciones que no se pudieron convertir de forma segura."
+            if ai_analysis and ai_analysis.get("errors"):
+                error_message = "Ninguno de los motores pudo generar Java válido."
+
+            return jsonify({"error": error_message, "issues": issues, "warnings": warnings}), 422
 
         response = _format_validation_response(java_code, "ast", analysis)
         response.status_code = 200
         return response
 
-    except Exception as e:
-        if OPENAI_API_KEY:
-            try:
-                ai_code = ai_translate_python_to_java(code)
-                ai_analysis = _analyze_java_output(ai_code)
-                if ai_analysis["errors"]:
-                    return (
-                        jsonify(
-                            {
-                                "error": "El motor IA generó un resultado que aún requiere ajustes manuales.",
-                                "issues": ai_analysis["errors"],
-                                "warnings": ai_analysis["warnings"],
-                            }
-                        ),
-                        422,
-                    )
-                response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
-                response.status_code = 200
-                return response
-            except Exception as e2:
-                return jsonify({"error": f"AST y IA fallaron: {e} / {e2}"}), 400
-        return jsonify({"error": f"AST falló: {e}"}), 400
+    except Exception:
+        ai_code, ai_analysis, ai_warning = _attempt_ai_translation(code)
+        if ai_code and ai_analysis and not ai_analysis["errors"]:
+            response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
+            response.status_code = 200
+            return response
+
+        issues = ["El motor local no pudo procesar el código proporcionado."]
+        warnings = []
+        error_message = "No se pudo completar la transpilación automática."
+        status_code = 400
+
+        if ai_analysis:
+            issues.extend(ai_analysis.get("errors", []))
+            warnings.extend(ai_analysis.get("warnings", []))
+            status_code = 422 if ai_analysis.get("errors") else status_code
+            if ai_analysis.get("errors"):
+                error_message = "Ninguno de los motores pudo generar Java válido."
+            else:
+                error_message = "El motor local presentó un problema, pero la IA devolvió advertencias a revisar."
+
+        if ai_warning:
+            warnings.append(ai_warning)
+
+        return jsonify({"error": error_message, "issues": issues, "warnings": warnings}), status_code
 
 
 @app.route("/api/health", methods=["GET"])
