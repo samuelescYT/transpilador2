@@ -24,8 +24,7 @@ def infer_java_literal(node):
         if isinstance(v, bool):
             return "true" if v else "false"
         if isinstance(v, (int, float)):
-            # Simplificación: números -> double, agregamos .0 si es int para mantener coherencia
-            return str(float(v)) if isinstance(v, int) else str(v)
+            return str(v)
         if isinstance(v, str):
             return f"\"{java_escape(v)}\""
         if v is None:
@@ -52,29 +51,55 @@ class PyToJava(ast.NodeVisitor):
         self.in_method = False
         self.locals_stack = []  # por método
         self.declared_current = set()
+        self.imports = set()
+        self.types_stack = []
+        self.current_types = {}
 
     # helpers de indent
     def emit(self, s):
         self.lines.append("    " * self.current_indent + s)
 
+    def blank_line(self):
+        if self.lines and self.lines[-1] != "":
+            self.lines.append("")
+
     def push_locals(self):
         self.locals_stack.append(set())
+        self.types_stack.append({})
         self.declared_current = self.locals_stack[-1]
+        self.current_types = self.types_stack[-1]
 
     def pop_locals(self):
         self.locals_stack.pop()
+        self.types_stack.pop()
         self.declared_current = self.locals_stack[-1] if self.locals_stack else set()
+        self.current_types = self.types_stack[-1] if self.types_stack else {}
 
-    def declare_local_if_needed(self, name, expr_java):
-        # si no está declarada, usar 'var' para declarar
+    def declare_local_if_needed(self, name, expr_java, value_node=None):
+        inferred_kind = self._infer_expr_kind(value_node)
+        lowered = expr_java.strip()
+        if inferred_kind in (None, "object"):
+            if lowered.startswith("new ArrayList"):
+                if "Double" in lowered or all(self._is_numeric_literal(elt) for elt in getattr(value_node, "elts", [])):
+                    inferred_kind = "list_numeric"
+                else:
+                    inferred_kind = "list"
+        decl = self._declaration_for_kind(inferred_kind)
         if name not in self.declared_current:
-            self.emit(f"var {name} = {expr_java};")
+            if decl is None:
+                decl = "var"
+            self.emit(f"{decl} {name} = {expr_java};")
             self.declared_current.add(name)
         else:
             self.emit(f"{name} = {expr_java};")
+        if inferred_kind:
+            self.current_types[name] = inferred_kind
 
     # ---- visit ----
     def visit_Module(self, node):
+        body_lines = []
+        prev_lines, self.lines = self.lines, body_lines
+
         self.emit(f"public class {self.class_name} " + "{")
         self.current_indent += 1
         # punto de entrada (no siempre aplica, pero lo dejamos)
@@ -90,56 +115,103 @@ class PyToJava(ast.NodeVisitor):
         self.current_indent -= 1
         self.emit("}")
 
+        java_lines = self.lines
+        self.lines = prev_lines
+
+        header = []
+        if self.imports:
+            header.extend(sorted(f"import {imp};" for imp in self.imports))
+            header.append("")
+        self.lines.extend(header + java_lines)
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        # Suponemos retorno double/object si no hay Return claro
-        # Tipamos args como 'double' por simplicidad (se puede mejorar)
+        # Inferimos tipos básicos de los parámetros según su uso
+        arg_types = self._infer_arg_types(node)
         args = []
         for a in node.args.args:
-            args.append(f"double {as_identifier(a.arg)}")
+            name = as_identifier(a.arg)
+            inferred = arg_types.get(a.arg, "object")
+            if inferred == "numeric":
+                decl = "double"
+            elif inferred == "list_numeric":
+                decl = "List<Double>"
+                self.imports.add("java.util.List")
+            elif inferred == "list":
+                decl = "List<?>"
+                self.imports.add("java.util.List")
+            else:
+                decl = "Object"
+            args.append(f"{decl} {name}")
         args_s = ", ".join(args) if args else ""
 
         self.emit(f"public static Object {node.name}({args_s}) " + "{")
         self.current_indent += 1
         self.in_method = True
         self.push_locals()
+        for a in node.args.args:
+            name = as_identifier(a.arg)
+            self.declared_current.add(name)
+            self.current_types[name] = arg_types.get(a.arg, "object")
 
         for stmt in node.body:
             self.visit(stmt)
 
         # si nunca se retornó nada:
-        self.emit("return null;")
+        if not self._function_has_explicit_return(node):
+            self.emit("return null;")
 
         self.pop_locals()
         self.in_method = False
         self.current_indent -= 1
         self.emit("}")
+        self.blank_line()
+
+    def _function_has_explicit_return(self, node: ast.FunctionDef) -> bool:
+        class ReturnFinder(ast.NodeVisitor):
+            def __init__(self):
+                self.found = False
+
+            def visit_Return(self, _):
+                self.found = True
+
+            def generic_visit(self, n):
+                if not self.found:
+                    super().generic_visit(n)
+
+            def visit_FunctionDef(self, _):
+                # no profundizamos en funciones anidadas
+                pass
+
+            def visit_AsyncFunctionDef(self, _):
+                pass
+
+            def visit_Lambda(self, _):
+                pass
+
+        finder = ReturnFinder()
+        for stmt in node.body:
+            if finder.found:
+                break
+            finder.visit(stmt)
+        return finder.found
 
     def visit_Return(self, node: ast.Return):
         expr = self.expr(node.value)
         self.emit(f"return {expr};")
 
     def visit_Expr(self, node: ast.Expr):
-        # expresiones sueltas (como print)
-        if isinstance(node.value, ast.Call):
-            self.visit(node.value)
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "print":
+            args = [self.expr(arg) for arg in node.value.args]
+            joined = " + \" \" + ".join(args) if len(args) > 1 else (args[0] if args else "\"\"")
+            self.emit(f"System.out.println({joined});")
+            return
+        expr_java = self.expr(node.value)
+        if expr_java.startswith("/*"):
+            self.emit(expr_java)
         else:
-            # ignoramos otras expresiones solitarias
-            pass
+            self.emit(f"{expr_java};")
 
     def visit_Call(self, node: ast.Call):
-        # print(...)
-        if isinstance(node.func, ast.Name) and node.func.id == "print":
-            args_java = " + \" \" + ".join([self.expr(a) for a in node.args]) if len(node.args) > 1 else (self.expr(node.args[0]) if node.args else "\"\"")
-            self.emit(f"System.out.println({args_java});")
-            return
-
-        # len(x)
-        if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
-            target = self.expr(node.args[0])
-            self.emit(f"System.out.println(({target}).size());")
-            return
-
-        # llamadas genéricas -> comentario
         self.emit(f"// Llamada no mapeada: {ast.unparse(node)}")
 
     def visit_Assign(self, node: ast.Assign):
@@ -147,7 +219,7 @@ class PyToJava(ast.NodeVisitor):
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             name = as_identifier(node.targets[0].id)
             value_java = self.expr(node.value)
-            self.declare_local_if_needed(name, value_java)
+            self.declare_local_if_needed(name, value_java, node.value)
         else:
             self.emit(f"// Asignación compleja no mapeada: {ast.unparse(node)}")
 
@@ -195,7 +267,8 @@ class PyToJava(ast.NodeVisitor):
                 stop = self.expr(args[1])
                 step = self.expr(args[2])
                 # para step negativo habría que ajustar; lo simple:
-                self.emit(f"for (int {v} = (int)({start}); {v} < {stop}; {v}+={step}) " + "{")
+                comparator = ">" if self._is_negative_step(args[2]) else "<"
+                self.emit(f"for (int {v} = (int)({start}); {v} {comparator} {stop}; {v} += {step}) " + "{")
             else:
                 self.emit(f"// range con argumentos no soportados: {ast.unparse(node)}")
                 return
@@ -248,25 +321,39 @@ class PyToJava(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             # len(x)
             if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
-                t = self.expr(node.args[0])
-                return f"({t}).size()"
-            # print en expr (raro), devolvemos string
-            if isinstance(node.func, ast.Name) and node.func.id == "print":
-                args_java = " + \" \" + ".join([self.expr(a) for a in node.args]) if node.args else "\"\""
-                return f"(String)({args_java})"
+                target_node = node.args[0]
+                t = self.expr(target_node)
+                if isinstance(target_node, ast.Name) and self.current_types.get(target_node.id) in {"list", "list_numeric"}:
+                    return f"({t}).size()"
+                self.imports.add("java.util.List")
+                return f"((List<?>){self._wrap_for_cast(t)}).size()"
+            if isinstance(node.func, ast.Name):
+                if node.keywords:
+                    return f"/*call*/ {java_escape(ast.unparse(node))}"
+                func_name = as_identifier(node.func.id)
+                args = ", ".join(self.expr(arg) for arg in node.args)
+                return f"{func_name}({args})"
             # por defecto:
             return f"/*call*/ {java_escape(ast.unparse(node))}"
 
         if isinstance(node, ast.List):
             # ArrayList raw
-            items = [self.expr(elt) for elt in node.elts]
-            return f"new java.util.ArrayList(java.util.Arrays.asList({', '.join(items)}))"
+            items = [self._prepare_list_element(elt) for elt in node.elts]
+            if items:
+                self.imports.update({"java.util.ArrayList", "java.util.Arrays"})
+                return f"new ArrayList<>(Arrays.asList({', '.join(items)}))"
+            self.imports.add("java.util.ArrayList")
+            return "new ArrayList<>()"
 
         if isinstance(node, ast.Subscript):
             # a[i]
-            tgt = self.expr(node.value)
+            target_node = node.value
+            tgt = self.expr(target_node)
             idx = self.expr(node.slice)
-            return f"({tgt}).get((int)({idx}))"
+            if isinstance(target_node, ast.Name) and self.current_types.get(target_node.id) in {"list", "list_numeric"}:
+                return f"({tgt}).get((int)({idx}))"
+            self.imports.add("java.util.List")
+            return f"((List<?>){self._wrap_for_cast(tgt)}).get((int)({idx}))"
 
         if isinstance(node, ast.Attribute):
             # obj.attr -> lo dejamos como comentario (depende del tipo)
@@ -306,6 +393,190 @@ class PyToJava(ast.NodeVisitor):
             ast.In: "/* in */",
             ast.NotIn: "/* not in */",
         }.get(type(op), "/* ? */")
+
+    def _is_negative_step(self, node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value < 0
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) and isinstance(node.operand, ast.Constant):
+            val = node.operand.value
+            if isinstance(val, (int, float)):
+                return True
+        return False
+
+    def _infer_arg_types(self, node: ast.FunctionDef):
+        tracked = {a.arg for a in node.args.args}
+        visitor = _ArgUsageVisitor(tracked)
+        for stmt in node.body:
+            visitor.visit(stmt)
+        result = {}
+        for name, usage in visitor.usage.items():
+            if "list_numeric" in usage:
+                result[name] = "list_numeric"
+            elif "list" in usage:
+                result[name] = "list"
+            elif "numeric" in usage:
+                result[name] = "numeric"
+            else:
+                result[name] = "object"
+        return result
+
+    def _wrap_for_cast(self, expr_java: str) -> str:
+        expr_java = expr_java.strip()
+        if expr_java.startswith("(") and expr_java.endswith(")"):
+            return expr_java
+        return f"({expr_java})"
+
+    def _is_numeric_literal(self, node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) and isinstance(node.operand, ast.Constant):
+            return isinstance(node.operand.value, (int, float))
+        return False
+
+    def _infer_expr_kind(self, node):
+        if node is None:
+            return "object"
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return "bool"
+            if isinstance(node.value, (int, float)):
+                return "numeric"
+            if isinstance(node.value, str):
+                return "string"
+            return "object"
+        if isinstance(node, ast.List):
+            if all(self._infer_expr_kind(elt) == "numeric" for elt in node.elts):
+                return "list_numeric"
+            return "list"
+        if isinstance(node, ast.Name):
+            return self.current_types.get(node.id, "object")
+        if isinstance(node, ast.BinOp):
+            left = self._infer_expr_kind(node.left)
+            right = self._infer_expr_kind(node.right)
+            if "string" in {left, right}:
+                return "string"
+            if left == right == "numeric":
+                return "numeric"
+            if left.startswith("list") or right.startswith("list"):
+                return left if left.startswith("list") else right if right.startswith("list") else "object"
+            return "object"
+        if isinstance(node, ast.UnaryOp):
+            return self._infer_expr_kind(node.operand)
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id == "len":
+                    return "numeric"
+            return "object"
+        if isinstance(node, ast.Compare):
+            return "bool"
+        if isinstance(node, ast.BoolOp):
+            return "bool"
+        if isinstance(node, ast.Subscript):
+            target_kind = self._infer_expr_kind(node.value)
+            if target_kind == "list_numeric":
+                return "numeric"
+            if target_kind == "list":
+                return "object"
+            return "object"
+        return "object"
+
+    def _declaration_for_kind(self, kind):
+        if kind == "numeric":
+            return "double"
+        if kind == "bool":
+            return "boolean"
+        if kind == "string":
+            return "String"
+        if kind == "list_numeric":
+            self.imports.update({"java.util.List"})
+            return "List<Double>"
+        if kind == "list":
+            self.imports.update({"java.util.List"})
+            return "List<Object>"
+        return None
+
+    def _prepare_list_element(self, node):
+        lit = infer_java_literal(node)
+        if lit is not None:
+            if isinstance(node, ast.Constant) and isinstance(node.value, int):
+                return f"{float(node.value)}"
+            return lit
+        if isinstance(node, ast.Name) and self.current_types.get(node.id) == "numeric":
+            return f"Double.valueOf({node.id})"
+        if (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+        ):
+            return f"{float(-node.operand.value)}"
+        return self.expr(node)
+
+
+class _ArgUsageVisitor(ast.NodeVisitor):
+    def __init__(self, tracked):
+        self.tracked = set(tracked)
+        self.usage = {name: set() for name in tracked}
+
+    def mark(self, name, kind):
+        if name in self.usage:
+            self.usage[name].add(kind)
+
+    def visit_BinOp(self, node: ast.BinOp):
+        if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv)):
+            for side in (node.left, node.right):
+                if isinstance(side, ast.Name):
+                    self.mark(side.id, "numeric")
+                elif isinstance(side, ast.Subscript) and isinstance(side.value, ast.Name):
+                    self.mark(side.value.id, "list_numeric")
+        self.generic_visit(node)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp):
+        if isinstance(node.op, (ast.UAdd, ast.USub)):
+            operand = node.operand
+            if isinstance(operand, ast.Name):
+                self.mark(operand.id, "numeric")
+            elif isinstance(operand, ast.Subscript) and isinstance(operand.value, ast.Name):
+                self.mark(operand.value.id, "list_numeric")
+        self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare):
+        operands = [node.left, *node.comparators]
+        for operand in operands:
+            if isinstance(operand, ast.Name):
+                self.mark(operand.id, "numeric")
+            elif isinstance(operand, ast.Subscript) and isinstance(operand.value, ast.Name):
+                self.mark(operand.value.id, "list_numeric")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call):
+        if isinstance(node.func, ast.Name):
+            if node.func.id == "len" and len(node.args) == 1 and isinstance(node.args[0], ast.Name):
+                self.mark(node.args[0].id, "list")
+            if node.func.id == "range":
+                for arg in node.args:
+                    if isinstance(arg, ast.Name):
+                        self.mark(arg.id, "numeric")
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript):
+        if isinstance(node.value, ast.Name):
+            self.mark(node.value.id, "list")
+        if isinstance(node.slice, ast.Name):
+            self.mark(node.slice.id, "numeric")
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For):
+        if isinstance(node.iter, ast.Name):
+            self.mark(node.iter.id, "list")
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        # no profundizamos en funciones anidadas
+        return
+
+    def visit_AsyncFunctionDef(self, node):
+        return
 
 
 # ===== Fallback IA (opcional) =====
