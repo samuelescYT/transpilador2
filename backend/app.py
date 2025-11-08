@@ -1,10 +1,17 @@
 import os
 import ast
 import json
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+
+from typing import Dict, List
 
 load_dotenv()
 
@@ -54,6 +61,9 @@ class PyToJava(ast.NodeVisitor):
         self.imports = set()
         self.types_stack = []
         self.current_types = {}
+        self.function_return_types = {}
+        self.current_function_name = None
+        self.current_function_return_kind = None
 
     # helpers de indent
     def emit(self, s):
@@ -102,15 +112,30 @@ class PyToJava(ast.NodeVisitor):
 
         self.emit(f"public class {self.class_name} " + "{")
         self.current_indent += 1
-        # punto de entrada (no siempre aplica, pero lo dejamos)
+
+        has_top_level_code = any(not isinstance(stmt, ast.FunctionDef) for stmt in node.body)
+
         self.emit("public static void main(String[] args) {")
         self.current_indent += 1
-        self.emit("// TODO: invoca tus funciones aquí si es necesario")
+
+        if has_top_level_code:
+            self.in_method = True
+            self.push_locals()
+            for stmt in node.body:
+                if isinstance(stmt, ast.FunctionDef):
+                    continue
+                self.visit(stmt)
+            self.pop_locals()
+            self.in_method = False
+        else:
+            self.emit("// TODO: invoca tus funciones aquí si es necesario")
+
         self.current_indent -= 1
         self.emit("}")
-        # cuerpo
+
         for stmt in node.body:
-            self.visit(stmt)
+            if isinstance(stmt, ast.FunctionDef):
+                self.visit(stmt)
 
         self.current_indent -= 1
         self.emit("}")
@@ -144,7 +169,15 @@ class PyToJava(ast.NodeVisitor):
             args.append(f"{decl} {name}")
         args_s = ", ".join(args) if args else ""
 
-        self.emit(f"public static Object {node.name}({args_s}) " + "{")
+        previous_function = self.current_function_name
+        previous_return_kind = self.current_function_return_kind
+        self.current_function_name = node.name
+        self.current_function_return_kind = None
+        self.function_return_types.setdefault(node.name, "object")
+
+        signature_index = len(self.lines)
+        signature_template = f"public static __RET__ {node.name}({args_s}) " + "{"
+        self.emit(signature_template)
         self.current_indent += 1
         self.in_method = True
         self.push_locals()
@@ -165,6 +198,14 @@ class PyToJava(ast.NodeVisitor):
         self.current_indent -= 1
         self.emit("}")
         self.blank_line()
+
+        resolved_kind = self.current_function_return_kind or "object"
+        self.function_return_types[node.name] = resolved_kind
+        return_type = self._return_type_for_kind(resolved_kind)
+        self.lines[signature_index] = self.lines[signature_index].replace("__RET__", return_type)
+
+        self.current_function_name = previous_function
+        self.current_function_return_kind = previous_return_kind
 
     def _function_has_explicit_return(self, node: ast.FunctionDef) -> bool:
         class ReturnFinder(ast.NodeVisitor):
@@ -196,6 +237,8 @@ class PyToJava(ast.NodeVisitor):
         return finder.found
 
     def visit_Return(self, node: ast.Return):
+        kind = self._infer_expr_kind(node.value)
+        self.current_function_return_kind = self._merge_kinds(self.current_function_return_kind, kind)
         expr = self.expr(node.value)
         self.emit(f"return {expr};")
 
@@ -466,6 +509,10 @@ class PyToJava(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id == "len":
                     return "numeric"
+                if node.func.id == self.current_function_name and self.current_function_return_kind:
+                    return self.current_function_return_kind
+                if node.func.id in self.function_return_types:
+                    return self.function_return_types[node.func.id]
             return "object"
         if isinstance(node, ast.Compare):
             return "bool"
@@ -494,6 +541,28 @@ class PyToJava(ast.NodeVisitor):
             self.imports.update({"java.util.List"})
             return "List<Object>"
         return None
+
+    def _return_type_for_kind(self, kind):
+        decl = self._declaration_for_kind(kind)
+        return decl or "Object"
+
+    def _merge_kinds(self, current, new_kind):
+        if new_kind is None:
+            return current or "object"
+        if current is None:
+            return new_kind
+        if current == new_kind:
+            return current
+        numeric_like = {"numeric", "list_numeric"}
+        if current in numeric_like and new_kind in numeric_like:
+            return "numeric"
+        if {current, new_kind} == {"object", "numeric"}:
+            return "object"
+        if {current, new_kind} == {"object", "bool"}:
+            return "object"
+        if {current, new_kind} == {"object", "string"}:
+            return "object"
+        return "object"
 
     def _prepare_list_element(self, node):
         lit = infer_java_literal(node)
@@ -604,8 +673,19 @@ Código Python:
         ],
         "temperature": 0.1
     }
-    r = requests.post(url, headers=headers, data=json.dumps(data), timeout=60)
-    r.raise_for_status()
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(data), timeout=60)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as http_err:
+        status = http_err.response.status_code if http_err.response else None
+        if status == 401:
+            raise RuntimeError(
+                "La clave de OpenAI es inválida o el modelo configurado no está autorizado."
+            ) from http_err
+        raise RuntimeError(f"La API de OpenAI respondió con un error {status}: {http_err.response.text if http_err.response else http_err}") from http_err
+    except requests.exceptions.RequestException as req_err:
+        raise RuntimeError(f"No se pudo contactar la API de OpenAI: {req_err}") from req_err
+
     out = r.json()["choices"][0]["message"]["content"]
     # limpiamos fences si vienen
     if out.strip().startswith("```"):
@@ -615,6 +695,107 @@ Código Python:
     return out.strip()
 
 
+def _validate_with_javac(java_code: str) -> List[str]:
+    """Compila el código generado para comprobar si es válido."""
+
+    try:
+        class_name = _extract_java_class_name(java_code) or "TranspiledExample"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            java_path = Path(tmpdir) / f"{class_name}.java"
+            java_path.write_text(java_code, encoding="utf-8")
+            try:
+                result = subprocess.run(
+                    ["javac", str(java_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except FileNotFoundError:
+                return ["javac no está disponible para validar el código Java generado."]
+            except subprocess.TimeoutExpired:
+                return ["La validación automática con javac excedió el tiempo límite permitido."]
+
+            if result.returncode != 0:
+                return _clean_javac_errors(result.stderr, java_path, class_name)
+    except Exception as exc:
+        return [f"No se pudo validar el código Java con javac: {exc}"]
+
+    return []
+
+
+def _clean_javac_errors(stderr: str, java_path: Path, class_name: str) -> List[str]:
+    """Formatea los errores de javac para que sean más legibles."""
+
+    clean: List[str] = []
+    replacement = f"{class_name}.java"
+    path_str = str(java_path)
+    for raw_line in stderr.splitlines():
+        line = raw_line.strip()
+        if not line or line == "^":
+            continue
+        line = line.replace(path_str, replacement)
+        clean.append(line)
+    if clean:
+        clean.insert(0, "El código Java generado no compila correctamente:")
+    return clean
+
+
+def _extract_java_class_name(java_code: str):
+    match = re.search(r"public\s+class\s+(\w+)", java_code)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _analyze_java_output(java_code: str) -> Dict[str, List[str]]:
+    """Detecta problemas comunes en el Java generado."""
+
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    marker_map = (
+        ("/*expr*/", "Se encontraron expresiones que no pudieron convertirse automáticamente.", "error"),
+        ("/*call*/", "Hay llamadas a funciones que no se reconocieron.", "error"),
+        ("/*attr*/", "Hay atributos u objetos sin conversión directa.", "warning"),
+        ("// Llamada no mapeada", "Existen llamadas que no fueron mapeadas a Java.", "error"),
+        ("// Asignación compleja no mapeada", "Se detectaron asignaciones complejas sin conversión.", "error"),
+        ("// range con argumentos no soportados", "Se usa range con argumentos que no se pudieron convertir.", "error"),
+        ("// for no soportado", "Existe un bucle for que no se pudo convertir.", "error"),
+    )
+
+    for marker, message, severity in marker_map:
+        if marker in java_code:
+            (errors if severity == "error" else warnings).append(message)
+
+    if "public class" not in java_code:
+        errors.append("No se encontró una declaración de clase pública en el resultado.")
+
+    if "public static void main" not in java_code:
+        warnings.append("No se detectó un método main; verifica si necesitas un punto de entrada.")
+
+    if java_code.count("{") != java_code.count("}"):
+        errors.append("Las llaves de apertura y cierre no están balanceadas en el código Java generado.")
+
+    stripped = java_code.strip()
+    if not stripped or stripped.startswith("// Error"):
+        errors.append("No se obtuvo código Java ejecutable a partir de la entrada proporcionada.")
+
+    compile_feedback = _validate_with_javac(java_code)
+    if compile_feedback:
+        errors.extend(compile_feedback)
+
+    return {"warnings": warnings, "errors": errors}
+
+
+def _format_validation_response(java_code: str, engine: str, analysis: Dict[str, List[str]]):
+    payload = {
+        "javaCode": java_code,
+        "engine": engine,
+        "warnings": analysis.get("warnings", []),
+    }
+    return jsonify(payload)
+
+
 @app.route("/api/transpile", methods=["POST"])
 def transpile():
     """
@@ -622,28 +803,101 @@ def transpile():
     2) Si falla o queda muy incompleto, y hay API key: fallback IA.
     """
     data = request.get_json(force=True)
-    code = data.get("code", "")
+    code = data.get("code", "") if isinstance(data, dict) else ""
 
-    # 1) AST
+    if not isinstance(code, str):
+        return jsonify({"error": "Formato de solicitud inválido. Se esperaba un texto con código Python."}), 400
+
+    if not code.strip():
+        return jsonify({"error": "El código Python está vacío. Agrega contenido para continuar."}), 400
+
     try:
         tree = ast.parse(code)
+    except SyntaxError as e:
+        return (
+            jsonify(
+                {
+                    "error": "El código Python contiene un error de sintaxis.",
+                    "details": f"Línea {e.lineno}: {e.msg}",
+                }
+            ),
+            400,
+        )
+    except Exception as e:
+        return jsonify({"error": f"No se pudo analizar el código Python: {e}"}), 400
+
+    try:
         tr = PyToJava()
         tr.visit(tree)
-        java_code = "\n".join(tr.lines)
+        java_code = "\n".join(tr.lines).strip()
+        analysis = _analyze_java_output(java_code)
 
-        # Heurística: si el resultado tiene demasiados comentarios de "no mapeado",
-        # intentamos el fallback si hay API key.
-        if "no mapeado" in java_code or "/*call*/" in java_code or "/*attr*/" in java_code:
+        if analysis["errors"]:
             if OPENAI_API_KEY:
-                ai_code = ai_translate_python_to_java(code)
-                return jsonify({"javaCode": ai_code, "engine": "ai-fallback"})
-        return jsonify({"javaCode": java_code, "engine": "ast"})
+                try:
+                    ai_code = ai_translate_python_to_java(code)
+                    ai_analysis = _analyze_java_output(ai_code)
+                    if ai_analysis["errors"]:
+                        return (
+                            jsonify(
+                                {
+                                    "error": "Ninguno de los motores pudo generar Java válido.",
+                                    "issues": ai_analysis["errors"],
+                                    "warnings": ai_analysis["warnings"],
+                                }
+                            ),
+                            422,
+                        )
+                    response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
+                    response.status_code = 200
+                    return response
+                except Exception as e2:
+                    return (
+                        jsonify(
+                            {
+                                "error": "Los motores AST e IA fallaron al generar un resultado confiable.",
+                                "details": str(e2),
+                                "issues": analysis["errors"],
+                                "warnings": analysis["warnings"],
+                            }
+                        ),
+                        422,
+                    )
+
+            return (
+                jsonify(
+                    {
+                        "error": "El código contiene construcciones que no se pudieron convertir de forma segura.",
+                        "issues": analysis["errors"],
+                        "warnings": analysis["warnings"],
+                    }
+                ),
+                422,
+            )
+
+        response = _format_validation_response(java_code, "ast", analysis)
+        response.status_code = 200
+        return response
+
     except Exception as e:
-        # fallback IA si está disponible
         if OPENAI_API_KEY:
             try:
                 ai_code = ai_translate_python_to_java(code)
-                return jsonify({"javaCode": ai_code, "engine": "ai-fallback"})
+                ai_analysis = _analyze_java_output(ai_code)
+                if ai_analysis["errors"]:
+                    return (
+                        jsonify(
+                            {
+                                "error": "El motor IA generó un resultado que aún requiere ajustes manuales.",
+                                "issues": ai_analysis["errors"],
+                                "warnings": ai_analysis["warnings"],
+                            }
+                        ),
+                        422,
+                    )
+                response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
+                response.status_code = 200
+                return response
             except Exception as e2:
                 return jsonify({"error": f"AST y IA fallaron: {e} / {e2}"}), 400
         return jsonify({"error": f"AST falló: {e}"}), 400
