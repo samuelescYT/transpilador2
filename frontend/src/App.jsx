@@ -125,9 +125,9 @@ export default function CapiTraduce() {
         ) : null}
 
         {/* Editores lado a lado */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="flex flex-col gap-6 lg:flex-row">
           {/* Python */}
-          <div>
+          <div className="flex-1 min-w-0">
             <h2 className="mb-3 text-center text-lg font-semibold text-slate-600">Código Python</h2>
             <CodeEditor
               value={pythonCode}
@@ -139,7 +139,7 @@ export default function CapiTraduce() {
           </div>
 
           {/* Java */}
-          <div>
+          <div className="flex-1 min-w-0">
             <h2 className="mb-3 text-center text-lg font-semibold text-slate-600">Código Java</h2>
             <CodeEditor
               value={javaCode}

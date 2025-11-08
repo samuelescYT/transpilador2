@@ -1,6 +1,11 @@
 import os
 import ast
 import json
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -104,15 +109,30 @@ class PyToJava(ast.NodeVisitor):
 
         self.emit(f"public class {self.class_name} " + "{")
         self.current_indent += 1
-        # punto de entrada (no siempre aplica, pero lo dejamos)
+
+        has_top_level_code = any(not isinstance(stmt, ast.FunctionDef) for stmt in node.body)
+
         self.emit("public static void main(String[] args) {")
         self.current_indent += 1
-        self.emit("// TODO: invoca tus funciones aquí si es necesario")
+
+        if has_top_level_code:
+            self.in_method = True
+            self.push_locals()
+            for stmt in node.body:
+                if isinstance(stmt, ast.FunctionDef):
+                    continue
+                self.visit(stmt)
+            self.pop_locals()
+            self.in_method = False
+        else:
+            self.emit("// TODO: invoca tus funciones aquí si es necesario")
+
         self.current_indent -= 1
         self.emit("}")
-        # cuerpo
+
         for stmt in node.body:
-            self.visit(stmt)
+            if isinstance(stmt, ast.FunctionDef):
+                self.visit(stmt)
 
         self.current_indent -= 1
         self.emit("}")
@@ -617,6 +637,58 @@ Código Python:
     return out.strip()
 
 
+def _validate_with_javac(java_code: str) -> List[str]:
+    """Compila el código generado para comprobar si es válido."""
+
+    try:
+        class_name = _extract_java_class_name(java_code) or "TranspiledExample"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            java_path = Path(tmpdir) / f"{class_name}.java"
+            java_path.write_text(java_code, encoding="utf-8")
+            try:
+                result = subprocess.run(
+                    ["javac", str(java_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except FileNotFoundError:
+                return ["javac no está disponible para validar el código Java generado."]
+            except subprocess.TimeoutExpired:
+                return ["La validación automática con javac excedió el tiempo límite permitido."]
+
+            if result.returncode != 0:
+                return _clean_javac_errors(result.stderr, java_path, class_name)
+    except Exception as exc:
+        return [f"No se pudo validar el código Java con javac: {exc}"]
+
+    return []
+
+
+def _clean_javac_errors(stderr: str, java_path: Path, class_name: str) -> List[str]:
+    """Formatea los errores de javac para que sean más legibles."""
+
+    clean: List[str] = []
+    replacement = f"{class_name}.java"
+    path_str = str(java_path)
+    for raw_line in stderr.splitlines():
+        line = raw_line.strip()
+        if not line or line == "^":
+            continue
+        line = line.replace(path_str, replacement)
+        clean.append(line)
+    if clean:
+        clean.insert(0, "El código Java generado no compila correctamente:")
+    return clean
+
+
+def _extract_java_class_name(java_code: str):
+    match = re.search(r"public\s+class\s+(\w+)", java_code)
+    if match:
+        return match.group(1)
+    return None
+
+
 def _analyze_java_output(java_code: str) -> Dict[str, List[str]]:
     """Detecta problemas comunes en el Java generado."""
 
@@ -649,6 +721,10 @@ def _analyze_java_output(java_code: str) -> Dict[str, List[str]]:
     stripped = java_code.strip()
     if not stripped or stripped.startswith("// Error"):
         errors.append("No se obtuvo código Java ejecutable a partir de la entrada proporcionada.")
+
+    compile_feedback = _validate_with_javac(java_code)
+    if compile_feedback:
+        errors.extend(compile_feedback)
 
     return {"warnings": warnings, "errors": errors}
 

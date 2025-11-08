@@ -34,7 +34,8 @@ export default function CodeEditor({
     >
       <div
         ref={gutterRef}
-        className="hidden select-none overflow-hidden border-r border-slate-800/60 bg-slate-900/80 px-4 py-4 text-right text-xs font-semibold text-slate-600/90 md:block"
+        className="select-none overflow-hidden border-r border-slate-800/60 bg-slate-900/80 px-4 py-4 text-right text-xs font-semibold text-slate-500"
+        style={{ width: "3.5rem" }}
       >
         <pre className="leading-6">
           {lineNumbers.map((line) => (
