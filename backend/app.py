@@ -61,6 +61,9 @@ class PyToJava(ast.NodeVisitor):
         self.imports = set()
         self.types_stack = []
         self.current_types = {}
+        self.function_return_types = {}
+        self.current_function_name = None
+        self.current_function_return_kind = None
 
     # helpers de indent
     def emit(self, s):
@@ -166,7 +169,15 @@ class PyToJava(ast.NodeVisitor):
             args.append(f"{decl} {name}")
         args_s = ", ".join(args) if args else ""
 
-        self.emit(f"public static Object {node.name}({args_s}) " + "{")
+        previous_function = self.current_function_name
+        previous_return_kind = self.current_function_return_kind
+        self.current_function_name = node.name
+        self.current_function_return_kind = None
+        self.function_return_types.setdefault(node.name, "object")
+
+        signature_index = len(self.lines)
+        signature_template = f"public static __RET__ {node.name}({args_s}) " + "{"
+        self.emit(signature_template)
         self.current_indent += 1
         self.in_method = True
         self.push_locals()
@@ -187,6 +198,14 @@ class PyToJava(ast.NodeVisitor):
         self.current_indent -= 1
         self.emit("}")
         self.blank_line()
+
+        resolved_kind = self.current_function_return_kind or "object"
+        self.function_return_types[node.name] = resolved_kind
+        return_type = self._return_type_for_kind(resolved_kind)
+        self.lines[signature_index] = self.lines[signature_index].replace("__RET__", return_type)
+
+        self.current_function_name = previous_function
+        self.current_function_return_kind = previous_return_kind
 
     def _function_has_explicit_return(self, node: ast.FunctionDef) -> bool:
         class ReturnFinder(ast.NodeVisitor):
@@ -218,6 +237,8 @@ class PyToJava(ast.NodeVisitor):
         return finder.found
 
     def visit_Return(self, node: ast.Return):
+        kind = self._infer_expr_kind(node.value)
+        self.current_function_return_kind = self._merge_kinds(self.current_function_return_kind, kind)
         expr = self.expr(node.value)
         self.emit(f"return {expr};")
 
@@ -488,6 +509,10 @@ class PyToJava(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id == "len":
                     return "numeric"
+                if node.func.id == self.current_function_name and self.current_function_return_kind:
+                    return self.current_function_return_kind
+                if node.func.id in self.function_return_types:
+                    return self.function_return_types[node.func.id]
             return "object"
         if isinstance(node, ast.Compare):
             return "bool"
@@ -516,6 +541,28 @@ class PyToJava(ast.NodeVisitor):
             self.imports.update({"java.util.List"})
             return "List<Object>"
         return None
+
+    def _return_type_for_kind(self, kind):
+        decl = self._declaration_for_kind(kind)
+        return decl or "Object"
+
+    def _merge_kinds(self, current, new_kind):
+        if new_kind is None:
+            return current or "object"
+        if current is None:
+            return new_kind
+        if current == new_kind:
+            return current
+        numeric_like = {"numeric", "list_numeric"}
+        if current in numeric_like and new_kind in numeric_like:
+            return "numeric"
+        if {current, new_kind} == {"object", "numeric"}:
+            return "object"
+        if {current, new_kind} == {"object", "bool"}:
+            return "object"
+        if {current, new_kind} == {"object", "string"}:
+            return "object"
+        return "object"
 
     def _prepare_list_element(self, node):
         lit = infer_java_literal(node)
@@ -626,8 +673,19 @@ Código Python:
         ],
         "temperature": 0.1
     }
-    r = requests.post(url, headers=headers, data=json.dumps(data), timeout=60)
-    r.raise_for_status()
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(data), timeout=60)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as http_err:
+        status = http_err.response.status_code if http_err.response else None
+        if status == 401:
+            raise RuntimeError(
+                "La clave de OpenAI es inválida o el modelo configurado no está autorizado."
+            ) from http_err
+        raise RuntimeError(f"La API de OpenAI respondió con un error {status}: {http_err.response.text if http_err.response else http_err}") from http_err
+    except requests.exceptions.RequestException as req_err:
+        raise RuntimeError(f"No se pudo contactar la API de OpenAI: {req_err}") from req_err
+
     out = r.json()["choices"][0]["message"]["content"]
     # limpiamos fences si vienen
     if out.strip().startswith("```"):

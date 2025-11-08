@@ -125,7 +125,7 @@ export default function CapiTraduce() {
         ) : null}
 
         {/* Editores lado a lado */}
-        <div className="flex flex-col gap-6 lg:flex-row">
+        <div className="flex flex-col gap-6 md:flex-row">
           {/* Python */}
           <div className="flex-1 min-w-0">
             <h2 className="mb-3 text-center text-lg font-semibold text-slate-600">Código Python</h2>
