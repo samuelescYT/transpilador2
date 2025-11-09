@@ -64,6 +64,7 @@ class PyToJava(ast.NodeVisitor):
         self.function_return_types = {}
         self.current_function_name = None
         self.current_function_return_kind = None
+        self.scanner_initialized = []
 
     # helpers de indent
     def emit(self, s):
@@ -76,14 +77,38 @@ class PyToJava(ast.NodeVisitor):
     def push_locals(self):
         self.locals_stack.append(set())
         self.types_stack.append({})
+        self.scanner_initialized.append(False)
         self.declared_current = self.locals_stack[-1]
         self.current_types = self.types_stack[-1]
 
     def pop_locals(self):
         self.locals_stack.pop()
         self.types_stack.pop()
+        self.scanner_initialized.pop()
         self.declared_current = self.locals_stack[-1] if self.locals_stack else set()
         self.current_types = self.types_stack[-1] if self.types_stack else {}
+
+    def ensure_scanner_available(self):
+        if not self.scanner_initialized:
+            return
+        if self.scanner_initialized[-1]:
+            return
+        self.imports.add("java.util.Scanner")
+        self.emit("Scanner scanner = new Scanner(System.in);")
+        self.declared_current.add("scanner")
+        self.current_types["scanner"] = "scanner"
+        self.scanner_initialized[-1] = True
+
+    def translate_input_call(self, node: ast.Call) -> str:
+        prompt_args = []
+        if node.args:
+            prompt_expr = self.expr(node.args[0])
+            prompt_args.append(prompt_expr)
+        if prompt_args:
+            self.emit(f"System.out.print({prompt_args[0]});")
+            self.emit("System.out.flush();")
+        self.ensure_scanner_available()
+        return "scanner.nextLine()"
 
     def declare_local_if_needed(self, name, expr_java, value_node=None):
         inferred_kind = self._infer_expr_kind(value_node)
@@ -362,18 +387,41 @@ class PyToJava(ast.NodeVisitor):
             return "(" + " && ".join(comps) + ")"
 
         if isinstance(node, ast.Call):
-            # len(x)
-            if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
-                target_node = node.args[0]
-                t = self.expr(target_node)
-                if isinstance(target_node, ast.Name) and self.current_types.get(target_node.id) in {"list", "list_numeric"}:
-                    return f"({t}).size()"
-                self.imports.add("java.util.List")
-                return f"((List<?>){self._wrap_for_cast(t)}).size()"
             if isinstance(node.func, ast.Name):
+                func_id = node.func.id
+                if func_id == "len" and len(node.args) == 1:
+                    target_node = node.args[0]
+                    t = self.expr(target_node)
+                    if isinstance(target_node, ast.Name) and self.current_types.get(target_node.id) in {"list", "list_numeric"}:
+                        return f"({t}).size()"
+                    self.imports.add("java.util.List")
+                    return f"((List<?>){self._wrap_for_cast(t)}).size()"
+                if func_id == "input":
+                    return self.translate_input_call(node)
+                if func_id in {"int", "float", "str"} and len(node.args) == 1 and not node.keywords:
+                    arg_node = node.args[0]
+                    from_input = (
+                        isinstance(arg_node, ast.Call)
+                        and isinstance(arg_node.func, ast.Name)
+                        and arg_node.func.id == "input"
+                    )
+                    if from_input:
+                        input_expr = self.translate_input_call(arg_node)
+                    else:
+                        input_expr = self.expr(arg_node)
+                    if func_id == "int":
+                        return (
+                            f"Integer.parseInt({input_expr})" if from_input else f"(int)({input_expr})"
+                        )
+                    if func_id == "float":
+                        return (
+                            f"Double.parseDouble({input_expr})" if from_input else f"(double)({input_expr})"
+                        )
+                    if func_id == "str":
+                        return f"String.valueOf({input_expr})"
                 if node.keywords:
                     return f"/*call*/ {java_escape(ast.unparse(node))}"
-                func_name = as_identifier(node.func.id)
+                func_name = as_identifier(func_id)
                 args = ", ".join(self.expr(arg) for arg in node.args)
                 return f"{func_name}({args})"
             # por defecto:
@@ -509,6 +557,14 @@ class PyToJava(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id == "len":
                     return "numeric"
+                if node.func.id == "input":
+                    return "string"
+                if node.func.id == "int":
+                    return "numeric"
+                if node.func.id == "float":
+                    return "numeric"
+                if node.func.id == "str":
+                    return "string"
                 if node.func.id == self.current_function_name and self.current_function_return_kind:
                     return self.current_function_return_kind
                 if node.func.id in self.function_return_types:
