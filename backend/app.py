@@ -530,8 +530,10 @@ class PyToJava(ast.NodeVisitor):
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
                 return "bool"
-            if isinstance(node.value, (int, float)):
-                return "numeric"
+            if isinstance(node.value, int):
+                return "int"
+            if isinstance(node.value, float):
+                return "float"
             if isinstance(node.value, str):
                 return "string"
             return "object"
@@ -546,7 +548,16 @@ class PyToJava(ast.NodeVisitor):
             right = self._infer_expr_kind(node.right)
             if "string" in {left, right}:
                 return "string"
-            if left == right == "numeric":
+            numeric_like = {"numeric", "float", "int"}
+            if left in numeric_like and right in numeric_like:
+                if left == right == "int":
+                    return "int"
+                if left == right == "float":
+                    return "float"
+                if "float" in {left, right}:
+                    return "float"
+                if "numeric" in {left, right}:
+                    return "numeric"
                 return "numeric"
             if left.startswith("list") or right.startswith("list"):
                 return left if left.startswith("list") else right if right.startswith("list") else "object"
@@ -560,9 +571,9 @@ class PyToJava(ast.NodeVisitor):
                 if node.func.id == "input":
                     return "string"
                 if node.func.id == "int":
-                    return "numeric"
+                    return "int"
                 if node.func.id == "float":
-                    return "numeric"
+                    return "float"
                 if node.func.id == "str":
                     return "string"
                 if node.func.id == self.current_function_name and self.current_function_return_kind:
@@ -584,7 +595,9 @@ class PyToJava(ast.NodeVisitor):
         return "object"
 
     def _declaration_for_kind(self, kind):
-        if kind == "numeric":
+        if kind == "int":
+            return "int"
+        if kind in {"numeric", "float"}:
             return "double"
         if kind == "bool":
             return "boolean"
@@ -609,8 +622,18 @@ class PyToJava(ast.NodeVisitor):
             return new_kind
         if current == new_kind:
             return current
-        numeric_like = {"numeric", "list_numeric"}
+        if {current, new_kind} == {"list_numeric", "numeric"}:
+            return "numeric"
+        if current == "list_numeric" or new_kind == "list_numeric":
+            return "object"
+        numeric_like = {"numeric", "float", "int"}
         if current in numeric_like and new_kind in numeric_like:
+            if "numeric" in {current, new_kind}:
+                return "numeric"
+            if {current, new_kind} == {"int", "float"}:
+                return "float"
+            if current == new_kind:
+                return current
             return "numeric"
         if {current, new_kind} == {"object", "numeric"}:
             return "object"
@@ -626,7 +649,7 @@ class PyToJava(ast.NodeVisitor):
             if isinstance(node, ast.Constant) and isinstance(node.value, int):
                 return f"{float(node.value)}"
             return lit
-        if isinstance(node, ast.Name) and self.current_types.get(node.id) == "numeric":
+        if isinstance(node, ast.Name) and self.current_types.get(node.id) in {"numeric", "float", "int"}:
             return f"Double.valueOf({node.id})"
         if (
             isinstance(node, ast.UnaryOp)
