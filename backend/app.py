@@ -1,10 +1,17 @@
 import os
 import ast
 import json
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+
+from typing import Dict, List
 
 load_dotenv()
 
@@ -54,6 +61,10 @@ class PyToJava(ast.NodeVisitor):
         self.imports = set()
         self.types_stack = []
         self.current_types = {}
+        self.function_return_types = {}
+        self.current_function_name = None
+        self.current_function_return_kind = None
+        self.scanner_initialized = []
 
     # helpers de indent
     def emit(self, s):
@@ -66,14 +77,34 @@ class PyToJava(ast.NodeVisitor):
     def push_locals(self):
         self.locals_stack.append(set())
         self.types_stack.append({})
+        self.scanner_initialized.append(False)
         self.declared_current = self.locals_stack[-1]
         self.current_types = self.types_stack[-1]
 
     def pop_locals(self):
         self.locals_stack.pop()
         self.types_stack.pop()
+        self.scanner_initialized.pop()
         self.declared_current = self.locals_stack[-1] if self.locals_stack else set()
         self.current_types = self.types_stack[-1] if self.types_stack else {}
+
+    def ensure_scanner_available(self):
+        if not self.scanner_initialized:
+            return
+        if self.scanner_initialized[-1]:
+            return
+        self.imports.add("java.util.Scanner")
+        self.emit("Scanner scanner = new Scanner(System.in);")
+        self.declared_current.add("scanner")
+        self.current_types["scanner"] = "scanner"
+        self.scanner_initialized[-1] = True
+
+    def translate_input_call(self, node: ast.Call) -> str:
+        self.ensure_scanner_available()
+        if node.args:
+            prompt_expr = self.expr(node.args[0])
+            self.emit(f"System.out.println({prompt_expr});")
+        return "scanner.nextLine()"
 
     def declare_local_if_needed(self, name, expr_java, value_node=None):
         inferred_kind = self._infer_expr_kind(value_node)
@@ -102,15 +133,30 @@ class PyToJava(ast.NodeVisitor):
 
         self.emit(f"public class {self.class_name} " + "{")
         self.current_indent += 1
-        # punto de entrada (no siempre aplica, pero lo dejamos)
+
+        has_top_level_code = any(not isinstance(stmt, ast.FunctionDef) for stmt in node.body)
+
         self.emit("public static void main(String[] args) {")
         self.current_indent += 1
-        self.emit("// TODO: invoca tus funciones aquí si es necesario")
+
+        if has_top_level_code:
+            self.in_method = True
+            self.push_locals()
+            for stmt in node.body:
+                if isinstance(stmt, ast.FunctionDef):
+                    continue
+                self.visit(stmt)
+            self.pop_locals()
+            self.in_method = False
+        else:
+            self.emit("// TODO: invoca tus funciones aquí si es necesario")
+
         self.current_indent -= 1
         self.emit("}")
-        # cuerpo
+
         for stmt in node.body:
-            self.visit(stmt)
+            if isinstance(stmt, ast.FunctionDef):
+                self.visit(stmt)
 
         self.current_indent -= 1
         self.emit("}")
@@ -144,7 +190,15 @@ class PyToJava(ast.NodeVisitor):
             args.append(f"{decl} {name}")
         args_s = ", ".join(args) if args else ""
 
-        self.emit(f"public static Object {node.name}({args_s}) " + "{")
+        previous_function = self.current_function_name
+        previous_return_kind = self.current_function_return_kind
+        self.current_function_name = node.name
+        self.current_function_return_kind = None
+        self.function_return_types.setdefault(node.name, "object")
+
+        signature_index = len(self.lines)
+        signature_template = f"public static __RET__ {node.name}({args_s}) " + "{"
+        self.emit(signature_template)
         self.current_indent += 1
         self.in_method = True
         self.push_locals()
@@ -165,6 +219,14 @@ class PyToJava(ast.NodeVisitor):
         self.current_indent -= 1
         self.emit("}")
         self.blank_line()
+
+        resolved_kind = self.current_function_return_kind or "object"
+        self.function_return_types[node.name] = resolved_kind
+        return_type = self._return_type_for_kind(resolved_kind)
+        self.lines[signature_index] = self.lines[signature_index].replace("__RET__", return_type)
+
+        self.current_function_name = previous_function
+        self.current_function_return_kind = previous_return_kind
 
     def _function_has_explicit_return(self, node: ast.FunctionDef) -> bool:
         class ReturnFinder(ast.NodeVisitor):
@@ -196,6 +258,8 @@ class PyToJava(ast.NodeVisitor):
         return finder.found
 
     def visit_Return(self, node: ast.Return):
+        kind = self._infer_expr_kind(node.value)
+        self.current_function_return_kind = self._merge_kinds(self.current_function_return_kind, kind)
         expr = self.expr(node.value)
         self.emit(f"return {expr};")
 
@@ -319,18 +383,41 @@ class PyToJava(ast.NodeVisitor):
             return "(" + " && ".join(comps) + ")"
 
         if isinstance(node, ast.Call):
-            # len(x)
-            if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
-                target_node = node.args[0]
-                t = self.expr(target_node)
-                if isinstance(target_node, ast.Name) and self.current_types.get(target_node.id) in {"list", "list_numeric"}:
-                    return f"({t}).size()"
-                self.imports.add("java.util.List")
-                return f"((List<?>){self._wrap_for_cast(t)}).size()"
             if isinstance(node.func, ast.Name):
+                func_id = node.func.id
+                if func_id == "len" and len(node.args) == 1:
+                    target_node = node.args[0]
+                    t = self.expr(target_node)
+                    if isinstance(target_node, ast.Name) and self.current_types.get(target_node.id) in {"list", "list_numeric"}:
+                        return f"({t}).size()"
+                    self.imports.add("java.util.List")
+                    return f"((List<?>){self._wrap_for_cast(t)}).size()"
+                if func_id == "input":
+                    return self.translate_input_call(node)
+                if func_id in {"int", "float", "str"} and len(node.args) == 1 and not node.keywords:
+                    arg_node = node.args[0]
+                    from_input = (
+                        isinstance(arg_node, ast.Call)
+                        and isinstance(arg_node.func, ast.Name)
+                        and arg_node.func.id == "input"
+                    )
+                    if from_input:
+                        input_expr = self.translate_input_call(arg_node)
+                    else:
+                        input_expr = self.expr(arg_node)
+                    if func_id == "int":
+                        return (
+                            f"Integer.parseInt({input_expr})" if from_input else f"(int)({input_expr})"
+                        )
+                    if func_id == "float":
+                        return (
+                            f"Double.parseDouble({input_expr})" if from_input else f"(double)({input_expr})"
+                        )
+                    if func_id == "str":
+                        return f"String.valueOf({input_expr})"
                 if node.keywords:
                     return f"/*call*/ {java_escape(ast.unparse(node))}"
-                func_name = as_identifier(node.func.id)
+                func_name = as_identifier(func_id)
                 args = ", ".join(self.expr(arg) for arg in node.args)
                 return f"{func_name}({args})"
             # por defecto:
@@ -439,8 +526,10 @@ class PyToJava(ast.NodeVisitor):
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
                 return "bool"
-            if isinstance(node.value, (int, float)):
-                return "numeric"
+            if isinstance(node.value, int):
+                return "int"
+            if isinstance(node.value, float):
+                return "float"
             if isinstance(node.value, str):
                 return "string"
             return "object"
@@ -455,7 +544,16 @@ class PyToJava(ast.NodeVisitor):
             right = self._infer_expr_kind(node.right)
             if "string" in {left, right}:
                 return "string"
-            if left == right == "numeric":
+            numeric_like = {"numeric", "float", "int"}
+            if left in numeric_like and right in numeric_like:
+                if left == right == "int":
+                    return "int"
+                if left == right == "float":
+                    return "float"
+                if "float" in {left, right}:
+                    return "float"
+                if "numeric" in {left, right}:
+                    return "numeric"
                 return "numeric"
             if left.startswith("list") or right.startswith("list"):
                 return left if left.startswith("list") else right if right.startswith("list") else "object"
@@ -466,6 +564,18 @@ class PyToJava(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id == "len":
                     return "numeric"
+                if node.func.id == "input":
+                    return "string"
+                if node.func.id == "int":
+                    return "int"
+                if node.func.id == "float":
+                    return "float"
+                if node.func.id == "str":
+                    return "string"
+                if node.func.id == self.current_function_name and self.current_function_return_kind:
+                    return self.current_function_return_kind
+                if node.func.id in self.function_return_types:
+                    return self.function_return_types[node.func.id]
             return "object"
         if isinstance(node, ast.Compare):
             return "bool"
@@ -481,7 +591,9 @@ class PyToJava(ast.NodeVisitor):
         return "object"
 
     def _declaration_for_kind(self, kind):
-        if kind == "numeric":
+        if kind == "int":
+            return "int"
+        if kind in {"numeric", "float"}:
             return "double"
         if kind == "bool":
             return "boolean"
@@ -495,13 +607,45 @@ class PyToJava(ast.NodeVisitor):
             return "List<Object>"
         return None
 
+    def _return_type_for_kind(self, kind):
+        decl = self._declaration_for_kind(kind)
+        return decl or "Object"
+
+    def _merge_kinds(self, current, new_kind):
+        if new_kind is None:
+            return current or "object"
+        if current is None:
+            return new_kind
+        if current == new_kind:
+            return current
+        if {current, new_kind} == {"list_numeric", "numeric"}:
+            return "numeric"
+        if current == "list_numeric" or new_kind == "list_numeric":
+            return "object"
+        numeric_like = {"numeric", "float", "int"}
+        if current in numeric_like and new_kind in numeric_like:
+            if "numeric" in {current, new_kind}:
+                return "numeric"
+            if {current, new_kind} == {"int", "float"}:
+                return "float"
+            if current == new_kind:
+                return current
+            return "numeric"
+        if {current, new_kind} == {"object", "numeric"}:
+            return "object"
+        if {current, new_kind} == {"object", "bool"}:
+            return "object"
+        if {current, new_kind} == {"object", "string"}:
+            return "object"
+        return "object"
+
     def _prepare_list_element(self, node):
         lit = infer_java_literal(node)
         if lit is not None:
             if isinstance(node, ast.Constant) and isinstance(node.value, int):
                 return f"{float(node.value)}"
             return lit
-        if isinstance(node, ast.Name) and self.current_types.get(node.id) == "numeric":
+        if isinstance(node, ast.Name) and self.current_types.get(node.id) in {"numeric", "float", "int"}:
             return f"Double.valueOf({node.id})"
         if (
             isinstance(node, ast.UnaryOp)
@@ -604,8 +748,19 @@ Código Python:
         ],
         "temperature": 0.1
     }
-    r = requests.post(url, headers=headers, data=json.dumps(data), timeout=60)
-    r.raise_for_status()
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(data), timeout=60)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as http_err:
+        status = http_err.response.status_code if http_err.response else None
+        if status == 401:
+            raise RuntimeError(
+                "La clave de OpenAI es inválida o el modelo configurado no está autorizado."
+            ) from http_err
+        raise RuntimeError(f"La API de OpenAI respondió con un error {status}: {http_err.response.text if http_err.response else http_err}") from http_err
+    except requests.exceptions.RequestException as req_err:
+        raise RuntimeError(f"No se pudo contactar la API de OpenAI: {req_err}") from req_err
+
     out = r.json()["choices"][0]["message"]["content"]
     # limpiamos fences si vienen
     if out.strip().startswith("```"):
@@ -615,6 +770,136 @@ Código Python:
     return out.strip()
 
 
+def _summarize_ai_failure(exc: Exception) -> str:
+    """Devuelve un mensaje entendible para el usuario sin códigos HTTP crudos."""
+
+    lowered = str(exc).strip().lower()
+    if not lowered:
+        return "La traducción asistida por IA no está disponible en este momento."
+
+    keywords = ("openai", "api", "clave", "unauthorized", "401", "key")
+    if any(token in lowered for token in keywords):
+        return "La traducción asistida por IA no está disponible: revisa la clave y el modelo configurados."
+
+    return "La traducción asistida por IA encontró un error inesperado. Intenta nuevamente en unos minutos."
+
+
+def _attempt_ai_translation(py_code: str):
+    """Ejecuta la ruta IA y devuelve (java_code, analysis, warning)."""
+
+    if not OPENAI_API_KEY:
+        return None, None, None
+
+    try:
+        ai_code = ai_translate_python_to_java(py_code)
+    except Exception as exc:  # noqa: BLE001 - queremos capturar y resumir cualquier fallo
+        return None, None, _summarize_ai_failure(exc)
+
+    ai_analysis = _analyze_java_output(ai_code)
+    return ai_code, ai_analysis, None
+
+
+def _validate_with_javac(java_code: str) -> List[str]:
+    """Compila el código generado para comprobar si es válido."""
+
+    try:
+        class_name = _extract_java_class_name(java_code) or "TranspiledExample"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            java_path = Path(tmpdir) / f"{class_name}.java"
+            java_path.write_text(java_code, encoding="utf-8")
+            try:
+                result = subprocess.run(
+                    ["javac", str(java_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except FileNotFoundError:
+                return ["javac no está disponible para validar el código Java generado."]
+            except subprocess.TimeoutExpired:
+                return ["La validación automática con javac excedió el tiempo límite permitido."]
+
+            if result.returncode != 0:
+                return _clean_javac_errors(result.stderr, java_path, class_name)
+    except Exception as exc:
+        return [f"No se pudo validar el código Java con javac: {exc}"]
+
+    return []
+
+
+def _clean_javac_errors(stderr: str, java_path: Path, class_name: str) -> List[str]:
+    """Formatea los errores de javac para que sean más legibles."""
+
+    clean: List[str] = []
+    replacement = f"{class_name}.java"
+    path_str = str(java_path)
+    for raw_line in stderr.splitlines():
+        line = raw_line.strip()
+        if not line or line == "^":
+            continue
+        line = line.replace(path_str, replacement)
+        clean.append(line)
+    if clean:
+        clean.insert(0, "El código Java generado no compila correctamente:")
+    return clean
+
+
+def _extract_java_class_name(java_code: str):
+    match = re.search(r"public\s+class\s+(\w+)", java_code)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _analyze_java_output(java_code: str) -> Dict[str, List[str]]:
+    """Detecta problemas comunes en el Java generado."""
+
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    marker_map = (
+        ("/*expr*/", "Se encontraron expresiones que no pudieron convertirse automáticamente.", "error"),
+        ("/*call*/", "Hay llamadas a funciones que no se reconocieron.", "error"),
+        ("/*attr*/", "Hay atributos u objetos sin conversión directa.", "warning"),
+        ("// Llamada no mapeada", "Existen llamadas que no fueron mapeadas a Java.", "error"),
+        ("// Asignación compleja no mapeada", "Se detectaron asignaciones complejas sin conversión.", "error"),
+        ("// range con argumentos no soportados", "Se usa range con argumentos que no se pudieron convertir.", "error"),
+        ("// for no soportado", "Existe un bucle for que no se pudo convertir.", "error"),
+    )
+
+    for marker, message, severity in marker_map:
+        if marker in java_code:
+            (errors if severity == "error" else warnings).append(message)
+
+    if "public class" not in java_code:
+        errors.append("No se encontró una declaración de clase pública en el resultado.")
+
+    if "public static void main" not in java_code:
+        warnings.append("No se detectó un método main; verifica si necesitas un punto de entrada.")
+
+    if java_code.count("{") != java_code.count("}"):
+        errors.append("Las llaves de apertura y cierre no están balanceadas en el código Java generado.")
+
+    stripped = java_code.strip()
+    if not stripped or stripped.startswith("// Error"):
+        errors.append("No se obtuvo código Java ejecutable a partir de la entrada proporcionada.")
+
+    compile_feedback = _validate_with_javac(java_code)
+    if compile_feedback:
+        errors.extend(compile_feedback)
+
+    return {"warnings": warnings, "errors": errors}
+
+
+def _format_validation_response(java_code: str, engine: str, analysis: Dict[str, List[str]]):
+    payload = {
+        "javaCode": java_code,
+        "engine": engine,
+        "warnings": analysis.get("warnings", []),
+    }
+    return jsonify(payload)
+
+
 @app.route("/api/transpile", methods=["POST"])
 def transpile():
     """
@@ -622,31 +907,87 @@ def transpile():
     2) Si falla o queda muy incompleto, y hay API key: fallback IA.
     """
     data = request.get_json(force=True)
-    code = data.get("code", "")
+    code = data.get("code", "") if isinstance(data, dict) else ""
 
-    # 1) AST
+    if not isinstance(code, str):
+        return jsonify({"error": "Formato de solicitud inválido. Se esperaba un texto con código Python."}), 400
+
+    if not code.strip():
+        return jsonify({"error": "El código Python está vacío. Agrega contenido para continuar."}), 400
+
     try:
         tree = ast.parse(code)
+    except SyntaxError as e:
+        return (
+            jsonify(
+                {
+                    "error": "El código Python contiene un error de sintaxis.",
+                    "details": f"Línea {e.lineno}: {e.msg}",
+                }
+            ),
+            400,
+        )
+    except Exception as e:
+        return jsonify({"error": f"No se pudo analizar el código Python: {e}"}), 400
+
+    try:
         tr = PyToJava()
         tr.visit(tree)
-        java_code = "\n".join(tr.lines)
+        java_code = "\n".join(tr.lines).strip()
+        analysis = _analyze_java_output(java_code)
 
-        # Heurística: si el resultado tiene demasiados comentarios de "no mapeado",
-        # intentamos el fallback si hay API key.
-        if "no mapeado" in java_code or "/*call*/" in java_code or "/*attr*/" in java_code:
-            if OPENAI_API_KEY:
-                ai_code = ai_translate_python_to_java(code)
-                return jsonify({"javaCode": ai_code, "engine": "ai-fallback"})
-        return jsonify({"javaCode": java_code, "engine": "ast"})
-    except Exception as e:
-        # fallback IA si está disponible
-        if OPENAI_API_KEY:
-            try:
-                ai_code = ai_translate_python_to_java(code)
-                return jsonify({"javaCode": ai_code, "engine": "ai-fallback"})
-            except Exception as e2:
-                return jsonify({"error": f"AST y IA fallaron: {e} / {e2}"}), 400
-        return jsonify({"error": f"AST falló: {e}"}), 400
+        if analysis["errors"]:
+            ai_code, ai_analysis, ai_warning = _attempt_ai_translation(code)
+            if ai_code and ai_analysis and not ai_analysis["errors"]:
+                response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
+                response.status_code = 200
+                return response
+
+            issues = list(analysis["errors"])
+            warnings = list(analysis["warnings"])
+
+            if ai_analysis:
+                issues.extend(ai_analysis.get("errors", []))
+                warnings.extend(ai_analysis.get("warnings", []))
+
+            if ai_warning:
+                warnings.append(ai_warning)
+
+            error_message = "El código contiene construcciones que no se pudieron convertir de forma segura."
+            if ai_analysis and ai_analysis.get("errors"):
+                error_message = "Ninguno de los motores pudo generar Java válido."
+
+            return jsonify({"error": error_message, "issues": issues, "warnings": warnings}), 422
+
+        response = _format_validation_response(java_code, "ast", analysis)
+        response.status_code = 200
+        return response
+
+    except Exception:
+        ai_code, ai_analysis, ai_warning = _attempt_ai_translation(code)
+        if ai_code and ai_analysis and not ai_analysis["errors"]:
+            response = _format_validation_response(ai_code, "ai-fallback", ai_analysis)
+            response.status_code = 200
+            return response
+
+        issues = ["El motor local no pudo procesar el código proporcionado."]
+        warnings = []
+        error_message = "No se pudo completar la transpilación automática."
+        status_code = 400
+
+        if ai_analysis:
+            issues.extend(ai_analysis.get("errors", []))
+            warnings.extend(ai_analysis.get("warnings", []))
+            status_code = 422 if ai_analysis.get("errors") else status_code
+            if ai_analysis.get("errors"):
+                error_message = "Ninguno de los motores pudo generar Java válido."
+            else:
+                error_message = "El motor local presentó un problema, pero la IA devolvió advertencias a revisar."
+
+        if ai_warning:
+            warnings.append(ai_warning)
+
+        return jsonify({"error": error_message, "issues": issues, "warnings": warnings}), status_code
 
 
 @app.route("/api/health", methods=["GET"])
