@@ -8,6 +8,13 @@ export default function CapiTraduce() {
   const [feedback, setFeedback] = useState(null);
   const [uploadedFileName, setUploadedFileName] = useState("");
   const fileInputRef = useRef(null);
+  const apiBase = useMemo(() => {
+    const configured = (import.meta.env?.VITE_API_BASE_URL || "").trim();
+    if (!configured) {
+      return "";
+    }
+    return configured.endsWith("/") ? configured.slice(0, -1) : configured;
+  }, []);
 
   async function transpilar(sourceOverride) {
     const codeToSend =
@@ -25,7 +32,8 @@ export default function CapiTraduce() {
     setProcessing(true);
     setFeedback(null);
     try {
-      const res = await fetch("http://localhost:8080/api/transpile", {
+      const endpoint = apiBase ? `${apiBase}/api/transpile` : "/api/transpile";
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: codeToSend }),
