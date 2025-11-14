@@ -23,7 +23,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 # ===== Utilidades mínimas =====
 def java_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 def infer_java_literal(node):
     if isinstance(node, ast.Constant):
@@ -65,6 +71,11 @@ class PyToJava(ast.NodeVisitor):
         self.current_function_name = None
         self.current_function_return_kind = None
         self.scanner_initialized = []
+        self.class_stack = []
+        self.current_self_name = None
+        self.known_classes = set()
+        self.class_method_returns = {}
+        self.declaration_positions = []
 
     # helpers de indent
     def emit(self, s):
@@ -78,6 +89,7 @@ class PyToJava(ast.NodeVisitor):
         self.locals_stack.append(set())
         self.types_stack.append({})
         self.scanner_initialized.append(False)
+        self.declaration_positions.append({})
         self.declared_current = self.locals_stack[-1]
         self.current_types = self.types_stack[-1]
 
@@ -85,6 +97,7 @@ class PyToJava(ast.NodeVisitor):
         self.locals_stack.pop()
         self.types_stack.pop()
         self.scanner_initialized.pop()
+        self.declaration_positions.pop()
         self.declared_current = self.locals_stack[-1] if self.locals_stack else set()
         self.current_types = self.types_stack[-1] if self.types_stack else {}
 
@@ -119,8 +132,15 @@ class PyToJava(ast.NodeVisitor):
         if name not in self.declared_current:
             if decl is None:
                 decl = "var"
-            self.emit(f"{decl} {name} = {expr_java};")
+            line = f"{decl} {name} = {expr_java};"
+            self.emit(line)
             self.declared_current.add(name)
+            if decl != "var" and self.declaration_positions:
+                stored_line = self.lines[-1]
+                prefix_len = len(stored_line) - len(stored_line.lstrip())
+                indent = stored_line[:prefix_len]
+                rest = stored_line[prefix_len + len(decl) + 1 :]
+                self.declaration_positions[-1][name] = (len(self.lines) - 1, indent, rest)
         else:
             self.emit(f"{name} = {expr_java};")
         if inferred_kind:
@@ -143,7 +163,7 @@ class PyToJava(ast.NodeVisitor):
             self.in_method = True
             self.push_locals()
             for stmt in node.body:
-                if isinstance(stmt, ast.FunctionDef):
+                if isinstance(stmt, (ast.FunctionDef, ast.ClassDef)):
                     continue
                 self.visit(stmt)
             self.pop_locals()
@@ -156,6 +176,8 @@ class PyToJava(ast.NodeVisitor):
 
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
+                self.visit(stmt)
+            elif isinstance(stmt, ast.ClassDef):
                 self.visit(stmt)
 
         self.current_indent -= 1
@@ -170,7 +192,46 @@ class PyToJava(ast.NodeVisitor):
             header.append("")
         self.lines.extend(header + java_lines)
 
+    def visit_ClassDef(self, node: ast.ClassDef):
+        class_name = as_identifier(node.name)
+        self.known_classes.add(class_name)
+        class_ctx = {
+            "name": class_name,
+            "fields": {},
+            "field_order": [],
+            "field_insert_index": None,
+            "method_returns": {},
+        }
+        self.class_stack.append(class_ctx)
+
+        self.emit(f"public static class {class_name} " + "{")
+        self.current_indent += 1
+        class_ctx["field_insert_index"] = len(self.lines)
+        class_ctx["indent"] = self.current_indent
+
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                self.visit(stmt)
+            elif isinstance(stmt, ast.Assign):
+                self._handle_class_level_assign(stmt)
+            else:
+                self.emit(f"// Elemento de clase no soportado: {java_escape(ast.unparse(stmt))}")
+
+        self._inject_class_fields(class_ctx)
+        self.current_indent -= 1
+        self.emit("}")
+        self.blank_line()
+
+        self.class_method_returns[class_name] = dict(class_ctx.get("method_returns", {}))
+        self.class_stack.pop()
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
+        if self.class_stack:
+            self._visit_method(node)
+        else:
+            self._visit_module_function(node)
+
+    def _visit_module_function(self, node: ast.FunctionDef):
         # Inferimos tipos básicos de los parámetros según su uso
         arg_types = self._infer_arg_types(node)
         args = []
@@ -185,6 +246,9 @@ class PyToJava(ast.NodeVisitor):
             elif inferred == "list":
                 decl = "List<?>"
                 self.imports.add("java.util.List")
+            elif inferred == "dict":
+                decl = "Map<String, Object>"
+                self.imports.update({"java.util.Map"})
             else:
                 decl = "Object"
             args.append(f"{decl} {name}")
@@ -207,12 +271,12 @@ class PyToJava(ast.NodeVisitor):
             self.declared_current.add(name)
             self.current_types[name] = arg_types.get(a.arg, "object")
 
+        has_return = self._function_has_explicit_return(node)
         for stmt in node.body:
             self.visit(stmt)
 
-        # si nunca se retornó nada:
-        if not self._function_has_explicit_return(node):
-            self.emit("return null;")
+        if not has_return and self.current_function_return_kind is None:
+            self.current_function_return_kind = "void"
 
         self.pop_locals()
         self.in_method = False
@@ -227,6 +291,230 @@ class PyToJava(ast.NodeVisitor):
 
         self.current_function_name = previous_function
         self.current_function_return_kind = previous_return_kind
+
+    def _visit_method(self, node: ast.FunctionDef):
+        class_ctx = self.class_stack[-1]
+        class_name = class_ctx["name"]
+        arg_types = self._infer_arg_types(node)
+        params = []
+
+        all_args = list(node.args.args)
+        self_name = None
+        if all_args:
+            self_name = all_args[0].arg
+            arg_types.pop(self_name, None)
+            all_args = all_args[1:]
+
+        for a in all_args:
+            name = as_identifier(a.arg)
+            inferred = arg_types.get(a.arg, "object")
+            if inferred == "numeric":
+                decl = "double"
+            elif inferred == "list_numeric":
+                decl = "List<Double>"
+                self.imports.add("java.util.List")
+            elif inferred == "list":
+                decl = "List<?>"
+                self.imports.add("java.util.List")
+            elif inferred == "dict":
+                decl = "Map<String, Object>"
+                self.imports.update({"java.util.Map"})
+            else:
+                decl = "Object"
+            params.append(f"{decl} {name}")
+
+        params_s = ", ".join(params)
+        previous_self = self.current_self_name
+        previous_function = self.current_function_name
+        previous_return_kind = self.current_function_return_kind
+        self.current_self_name = self_name
+        self.current_function_name = node.name
+        self.current_function_return_kind = None
+
+        is_constructor = node.name == "__init__"
+        if is_constructor:
+            signature = f"public {class_name}({params_s}) " + "{"
+        else:
+            signature = f"public __RET__ {node.name}({params_s}) " + "{"
+        signature_index = len(self.lines)
+        self.emit(signature)
+        self.current_indent += 1
+        self.in_method = True
+        self.push_locals()
+
+        if self_name:
+            self.declared_current.add(self_name)
+            self.current_types[self_name] = f"class:{class_name}"
+
+        for a in all_args:
+            name = as_identifier(a.arg)
+            self.declared_current.add(name)
+            self.current_types[name] = arg_types.get(a.arg, "object")
+
+        has_return = False if is_constructor else self._function_has_explicit_return(node)
+        for stmt in node.body:
+            self.visit(stmt)
+
+        if not is_constructor and not has_return and self.current_function_return_kind is None:
+            self.current_function_return_kind = "void"
+
+        self.pop_locals()
+        self.in_method = False
+        self.current_indent -= 1
+        self.emit("}")
+        self.blank_line()
+
+        method_returns = class_ctx.setdefault("method_returns", {})
+        if is_constructor:
+            method_returns[node.name] = "void"
+        else:
+            resolved_kind = self.current_function_return_kind or "object"
+            method_returns[node.name] = resolved_kind
+            return_type = self._return_type_for_kind(resolved_kind)
+            self.lines[signature_index] = self.lines[signature_index].replace("__RET__", return_type)
+
+        self.current_function_name = previous_function
+        self.current_function_return_kind = previous_return_kind
+        self.current_self_name = previous_self
+
+    def _handle_class_level_assign(self, node: ast.Assign):
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = as_identifier(node.targets[0].id)
+            value_java = self.expr(node.value)
+            self.emit(f"static Object {name} = {value_java};")
+        else:
+            self.emit(f"// Asignación de nivel de clase no soportada: {java_escape(ast.unparse(node))}")
+
+    def _inject_class_fields(self, class_ctx):
+        fields = class_ctx.get("fields") or {}
+        if not fields:
+            return
+        indent = "    " * class_ctx.get("indent", self.current_indent)
+        declarations = []
+        for name in class_ctx.get("field_order", []):
+            kind = fields.get(name, "object")
+            decl = self._declaration_for_kind(kind) or "Object"
+            declarations.append(f"{indent}{decl} {name};")
+        insert_at = class_ctx.get("field_insert_index", len(self.lines))
+        self.lines[insert_at:insert_at] = declarations + [""]
+
+    def _record_field_type(self, field_name: str, kind: str):
+        if not self.class_stack:
+            return
+        class_ctx = self.class_stack[-1]
+        kind = kind or "object"
+        if field_name not in class_ctx["fields"]:
+            class_ctx["field_order"].append(field_name)
+            class_ctx["fields"][field_name] = kind
+            return
+        merged = self._merge_kinds(class_ctx["fields"][field_name], kind)
+        class_ctx["fields"][field_name] = merged
+
+    def _resolve_attribute_kind(self, node):
+        if isinstance(node, ast.Name):
+            return self.current_types.get(node.id, "object")
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and self.class_stack
+            and node.value.id == self.current_self_name
+        ):
+            class_ctx = self.class_stack[-1]
+            return class_ctx["fields"].get(node.attr, "object")
+        return "object"
+
+    def _extract_class_name(self, kind):
+        if isinstance(kind, str) and kind.startswith("class:"):
+            return kind.split(":", 1)[1]
+        return None
+
+    def _maybe_update_list_kind(self, owner_node, value_node):
+        inferred = self._infer_expr_kind(value_node)
+        if inferred in {"int", "float", "numeric"}:
+            target_kind = "list_numeric"
+        elif inferred == "string":
+            target_kind = "list_string"
+        else:
+            return
+        self._apply_list_kind(owner_node, target_kind)
+
+    def _ensure_list_element(self, list_kind, expr_java, value_node):
+        if list_kind != "list_numeric":
+            return expr_java
+        inferred = self._infer_expr_kind(value_node)
+        if inferred == "int":
+            return f"Double.valueOf({expr_java})"
+        return expr_java
+
+    def _apply_list_kind(self, owner_node, target_kind):
+        if isinstance(owner_node, ast.Name):
+            name = owner_node.id
+            current = self.current_types.get(name)
+            if current in {"list", "list_numeric", "list_string"}:
+                new_kind = self._combine_list_kinds(current, target_kind)
+                self.current_types[name] = new_kind
+                self._update_local_declaration(name, new_kind)
+        elif (
+            isinstance(owner_node, ast.Attribute)
+            and isinstance(owner_node.value, ast.Name)
+            and self.class_stack
+            and owner_node.value.id == self.current_self_name
+        ):
+            class_ctx = self.class_stack[-1]
+            current = class_ctx["fields"].get(owner_node.attr)
+            if current in {"list", "list_numeric", "list_string"}:
+                class_ctx["fields"][owner_node.attr] = self._combine_list_kinds(current, target_kind)
+
+    def _combine_list_kinds(self, current, target):
+        if current == target:
+            return current
+        if current == "list":
+            return target
+        if target == "list":
+            return current
+        return "list"
+
+    def _update_local_declaration(self, name, kind):
+        if not self.declaration_positions:
+            return
+        for scope in reversed(self.declaration_positions):
+            if name in scope:
+                line_index, indent, rest = scope[name]
+                decl = self._declaration_for_kind(kind)
+                if decl and line_index < len(self.lines):
+                    self.lines[line_index] = f"{indent}{decl} {rest}"
+                return
+
+    def _assign_dict_literal(self, name: str, dict_node: ast.Dict):
+        java_name = as_identifier(name)
+        decl = self._declaration_for_kind("dict") or "Map<String, Object>"
+        self.imports.update({"java.util.HashMap", "java.util.Map"})
+        init = "new HashMap<>()"
+        if java_name not in self.declared_current:
+            self.emit(f"{decl} {java_name} = {init};")
+            self.declared_current.add(java_name)
+        else:
+            self.emit(f"{java_name} = {init};")
+        self.current_types[java_name] = "dict"
+        for key_node, value_node in zip(dict_node.keys, dict_node.values):
+            key_java = self.expr(key_node)
+            value_java = self.expr(value_node)
+            self.emit(f"{java_name}.put({key_java}, {value_java});")
+
+    def _assign_attribute(self, target: ast.Attribute, value_node):
+        owner = target.value
+        attr = target.attr
+        if (
+            isinstance(owner, ast.Name)
+            and self.class_stack
+            and owner.id == self.current_self_name
+        ):
+            value_java = self.expr(value_node)
+            kind = self._infer_expr_kind(value_node)
+            self._record_field_type(attr, kind)
+            self.emit(f"this.{attr} = {value_java};")
+        else:
+            self.emit(f"// Asignación de atributo no soportada: {java_escape(ast.unparse(target))} = {java_escape(ast.unparse(value_node))}")
 
     def _function_has_explicit_return(self, node: ast.FunctionDef) -> bool:
         class ReturnFinder(ast.NodeVisitor):
@@ -258,6 +546,10 @@ class PyToJava(ast.NodeVisitor):
         return finder.found
 
     def visit_Return(self, node: ast.Return):
+        if node.value is None:
+            self.current_function_return_kind = self._merge_kinds(self.current_function_return_kind, "void")
+            self.emit("return;")
+            return
         kind = self._infer_expr_kind(node.value)
         self.current_function_return_kind = self._merge_kinds(self.current_function_return_kind, kind)
         expr = self.expr(node.value)
@@ -280,14 +572,62 @@ class PyToJava(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign):
         # soporta: x = expr / a, b = ...
-        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            name = as_identifier(node.targets[0].id)
-            value_java = self.expr(node.value)
-            self.declare_local_if_needed(name, value_java, node.value)
+        if len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                if isinstance(node.value, ast.Dict):
+                    self._assign_dict_literal(target.id, node.value)
+                else:
+                    name = as_identifier(target.id)
+                    value_java = self.expr(node.value)
+                    self.declare_local_if_needed(name, value_java, node.value)
+            elif isinstance(target, ast.Attribute):
+                self._assign_attribute(target, node.value)
+            else:
+                self.emit(f"// Asignación compleja no mapeada: {ast.unparse(node)}")
         else:
             self.emit(f"// Asignación compleja no mapeada: {ast.unparse(node)}")
 
+    def visit_AugAssign(self, node: ast.AugAssign):
+        op = self._aug_op(node.op)
+        value_java = self.expr(node.value)
+        if isinstance(node.target, ast.Name):
+            name = as_identifier(node.target.id)
+            self.emit(f"{name} {op}= {value_java};")
+            inferred = self._infer_expr_kind(node.value)
+            if name in self.current_types:
+                self.current_types[name] = self._merge_kinds(self.current_types[name], inferred)
+                self._update_local_declaration(name, self.current_types[name])
+        elif (
+            isinstance(node.target, ast.Attribute)
+            and isinstance(node.target.value, ast.Name)
+            and self.class_stack
+            and node.target.value.id == self.current_self_name
+        ):
+            kind = self._infer_expr_kind(node.value)
+            self._record_field_type(node.target.attr, kind)
+            base = self.expr(node.target.value)
+            self.emit(f"{base}.{node.target.attr} {op}= {value_java};")
+        elif isinstance(node.target, ast.Attribute):
+            owner = self.expr(node.target.value)
+            self.emit(f"{owner}.{node.target.attr} {op}= {value_java};")
+        else:
+            self.emit(f"// Asignación aumentada no soportada: {ast.unparse(node)}")
+
     def visit_If(self, node: ast.If):
+        if (
+            isinstance(node.test, ast.Compare)
+            and len(node.test.ops) == 1
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "__main__"
+        ):
+            for s in node.body:
+                self.visit(s)
+            return
         test_java = self.expr(node.test)
         self.emit(f"if ({test_java}) " + "{")
         self.current_indent += 1
@@ -322,10 +662,14 @@ class PyToJava(ast.NodeVisitor):
             if len(args) == 1:
                 stop = self.expr(args[0])
                 self.emit(f"for (int {v} = 0; {v} < {stop}; {v}++) " + "{")
+                self.declared_current.add(v)
+                self.current_types[v] = "int"
             elif len(args) == 2:
                 start = self.expr(args[0])
                 stop = self.expr(args[1])
                 self.emit(f"for (int {v} = (int)({start}); {v} < {stop}; {v}++) " + "{")
+                self.declared_current.add(v)
+                self.current_types[v] = "int"
             elif len(args) == 3:
                 start = self.expr(args[0])
                 stop = self.expr(args[1])
@@ -333,6 +677,8 @@ class PyToJava(ast.NodeVisitor):
                 # para step negativo habría que ajustar; lo simple:
                 comparator = ">" if self._is_negative_step(args[2]) else "<"
                 self.emit(f"for (int {v} = (int)({start}); {v} {comparator} {stop}; {v} += {step}) " + "{")
+                self.declared_current.add(v)
+                self.current_types[v] = "int"
             else:
                 self.emit(f"// range con argumentos no soportados: {ast.unparse(node)}")
                 return
@@ -342,6 +688,28 @@ class PyToJava(ast.NodeVisitor):
             self.current_indent -= 1
             self.emit("}")
         else:
+            iter_kind = self._infer_expr_kind(node.iter)
+            if isinstance(node.target, ast.Name) and iter_kind in {"list", "list_numeric", "list_string"}:
+                var_name = as_identifier(node.target.id)
+                iter_expr = self.expr(node.iter)
+                if iter_kind == "list_numeric":
+                    element_decl = "double"
+                    element_kind = "numeric"
+                elif iter_kind == "list_string":
+                    element_decl = "String"
+                    element_kind = "string"
+                else:
+                    element_decl = "Object"
+                    element_kind = "object"
+                self.emit(f"for ({element_decl} {var_name} : {iter_expr}) " + "{")
+                self.declared_current.add(var_name)
+                self.current_types[var_name] = element_kind
+                self.current_indent += 1
+                for s in node.body:
+                    self.visit(s)
+                self.current_indent -= 1
+                self.emit("}")
+                return
             self.emit(f"// for no soportado (iteración no-range): {ast.unparse(node)}")
 
     # ======== Expresiones ========
@@ -355,6 +723,8 @@ class PyToJava(ast.NodeVisitor):
             return lit
 
         if isinstance(node, ast.Name):
+            if self.class_stack and node.id == self.current_self_name:
+                return "this"
             return as_identifier(node.id)
 
         if isinstance(node, ast.BinOp):
@@ -415,11 +785,26 @@ class PyToJava(ast.NodeVisitor):
                         )
                     if func_id == "str":
                         return f"String.valueOf({input_expr})"
+                if func_id in self.known_classes:
+                    args = ", ".join(self.expr(arg) for arg in node.args)
+                    return f"new {func_id}({args})"
                 if node.keywords:
                     return f"/*call*/ {java_escape(ast.unparse(node))}"
                 func_name = as_identifier(func_id)
                 args = ", ".join(self.expr(arg) for arg in node.args)
                 return f"{func_name}({args})"
+            if isinstance(node.func, ast.Attribute):
+                owner_node = node.func.value
+                owner_expr = self.expr(owner_node)
+                attr = node.func.attr
+                if attr == "append" and len(node.args) == 1:
+                    self._maybe_update_list_kind(owner_node, node.args[0])
+                    list_kind = self._resolve_attribute_kind(owner_node)
+                    value_expr = self.expr(node.args[0])
+                    value_expr = self._ensure_list_element(list_kind, value_expr, node.args[0])
+                    return f"{owner_expr}.add({value_expr})"
+                args = ", ".join(self.expr(arg) for arg in node.args)
+                return f"{owner_expr}.{attr}({args})"
             # por defecto:
             return f"/*call*/ {java_escape(ast.unparse(node))}"
 
@@ -437,14 +822,21 @@ class PyToJava(ast.NodeVisitor):
             target_node = node.value
             tgt = self.expr(target_node)
             idx = self.expr(node.slice)
-            if isinstance(target_node, ast.Name) and self.current_types.get(target_node.id) in {"list", "list_numeric"}:
+            target_kind = self._infer_expr_kind(target_node)
+            if isinstance(target_node, ast.Name) and target_kind in {"list", "list_numeric"}:
                 return f"({tgt}).get((int)({idx}))"
+            if target_kind in {"list", "list_numeric"}:
+                self.imports.add("java.util.List")
+                return f"((List<?>){self._wrap_for_cast(tgt)}).get((int)({idx}))"
+            if target_kind == "dict":
+                self.imports.add("java.util.Map")
+                return f"((Map<String, Object>){self._wrap_for_cast(tgt)}).get({idx})"
             self.imports.add("java.util.List")
             return f"((List<?>){self._wrap_for_cast(tgt)}).get((int)({idx}))"
 
         if isinstance(node, ast.Attribute):
-            # obj.attr -> lo dejamos como comentario (depende del tipo)
-            return f"/*attr*/ {java_escape(ast.unparse(node))}"
+            base = self.expr(node.value)
+            return f"{base}.{node.attr}"
 
         # por defecto
         return f"/*expr*/ {java_escape(ast.unparse(node))}"
@@ -459,6 +851,15 @@ class PyToJava(ast.NodeVisitor):
             ast.Pow: "**",  # (no mapeado directo)
             ast.FloorDiv: "/", # simplificación
         }.get(type(op), "?")
+
+    def _aug_op(self, op):
+        return {
+            ast.Add: "+",
+            ast.Sub: "-",
+            ast.Mult: "*",
+            ast.Div: "/",
+            ast.Mod: "%",
+        }.get(type(op), "+")
 
     def unop(self, op):
         return {
@@ -495,6 +896,11 @@ class PyToJava(ast.NodeVisitor):
         visitor = _ArgUsageVisitor(tracked)
         for stmt in node.body:
             visitor.visit(stmt)
+        defaults = {}
+        if node.args.defaults:
+            relevant = node.args.args[-len(node.args.defaults):]
+            for arg, default in zip(relevant, node.args.defaults):
+                defaults[arg.arg] = self._infer_expr_kind(default)
         result = {}
         for name, usage in visitor.usage.items():
             if "list_numeric" in usage:
@@ -505,6 +911,8 @@ class PyToJava(ast.NodeVisitor):
                 result[name] = "numeric"
             else:
                 result[name] = "object"
+            if name in defaults:
+                result[name] = self._merge_kinds(result[name], defaults[name])
         return result
 
     def _wrap_for_cast(self, expr_java: str) -> str:
@@ -534,9 +942,15 @@ class PyToJava(ast.NodeVisitor):
                 return "string"
             return "object"
         if isinstance(node, ast.List):
-            if all(self._infer_expr_kind(elt) == "numeric" for elt in node.elts):
-                return "list_numeric"
+            if node.elts:
+                element_kinds = {self._infer_expr_kind(elt) for elt in node.elts}
+                if element_kinds <= {"string"}:
+                    return "list_string"
+                if element_kinds <= {"numeric", "int", "float"}:
+                    return "list_numeric"
             return "list"
+        if isinstance(node, ast.Dict):
+            return "dict"
         if isinstance(node, ast.Name):
             return self.current_types.get(node.id, "object")
         if isinstance(node, ast.BinOp):
@@ -576,6 +990,15 @@ class PyToJava(ast.NodeVisitor):
                     return self.current_function_return_kind
                 if node.func.id in self.function_return_types:
                     return self.function_return_types[node.func.id]
+                if node.func.id in self.known_classes:
+                    return f"class:{node.func.id}"
+            if isinstance(node.func, ast.Attribute):
+                owner_kind = self._infer_expr_kind(node.func.value)
+                class_name = self._extract_class_name(owner_kind)
+                if class_name:
+                    method_kind = self.class_method_returns.get(class_name, {}).get(node.func.attr)
+                    if method_kind:
+                        return method_kind
             return "object"
         if isinstance(node, ast.Compare):
             return "bool"
@@ -587,10 +1010,25 @@ class PyToJava(ast.NodeVisitor):
                 return "numeric"
             if target_kind == "list":
                 return "object"
+            if target_kind == "list_string":
+                return "string"
+            if target_kind == "dict":
+                return "object"
+            return "object"
+        if isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and self.class_stack
+                and node.value.id == self.current_self_name
+            ):
+                class_ctx = self.class_stack[-1]
+                return class_ctx["fields"].get(node.attr, "object")
             return "object"
         return "object"
 
     def _declaration_for_kind(self, kind):
+        if isinstance(kind, str) and kind.startswith("class:"):
+            return kind.split(":", 1)[1]
         if kind == "int":
             return "int"
         if kind in {"numeric", "float"}:
@@ -605,9 +1043,17 @@ class PyToJava(ast.NodeVisitor):
         if kind == "list":
             self.imports.update({"java.util.List"})
             return "List<Object>"
+        if kind == "list_string":
+            self.imports.update({"java.util.List"})
+            return "List<String>"
+        if kind == "dict":
+            self.imports.update({"java.util.Map"})
+            return "Map<String, Object>"
         return None
 
     def _return_type_for_kind(self, kind):
+        if kind == "void":
+            return "void"
         decl = self._declaration_for_kind(kind)
         return decl or "Object"
 
@@ -616,11 +1062,40 @@ class PyToJava(ast.NodeVisitor):
             return current or "object"
         if current is None:
             return new_kind
+        if new_kind == "void":
+            return current or "void"
+        if current == "void":
+            return new_kind
+        if isinstance(new_kind, str) and new_kind.startswith("class:"):
+            if current in (None, "object", new_kind):
+                return new_kind
+            if isinstance(current, str) and current.startswith("class:") and current != new_kind:
+                return "object"
+            return new_kind
+        if isinstance(current, str) and current.startswith("class:"):
+            if new_kind in (None, "object", current):
+                return current
+            if isinstance(new_kind, str) and new_kind.startswith("class:") and new_kind != current:
+                return "object"
+            return "object"
+        if current == "object":
+            return new_kind
+        if new_kind == "object":
+            return current
         if current == new_kind:
             return current
+        list_kinds = {"list", "list_numeric", "list_string"}
+        if current in list_kinds and new_kind in list_kinds:
+            if current == "list":
+                return new_kind
+            if new_kind == "list":
+                return current
+            return "list"
         if {current, new_kind} == {"list_numeric", "numeric"}:
             return "numeric"
-        if current == "list_numeric" or new_kind == "list_numeric":
+        if {current, new_kind} == {"list_string", "string"}:
+            return "list_string"
+        if (current in list_kinds) or (new_kind in list_kinds):
             return "object"
         numeric_like = {"numeric", "float", "int"}
         if current in numeric_like and new_kind in numeric_like:
@@ -631,12 +1106,6 @@ class PyToJava(ast.NodeVisitor):
             if current == new_kind:
                 return current
             return "numeric"
-        if {current, new_kind} == {"object", "numeric"}:
-            return "object"
-        if {current, new_kind} == {"object", "bool"}:
-            return "object"
-        if {current, new_kind} == {"object", "string"}:
-            return "object"
         return "object"
 
     def _prepare_list_element(self, node):
@@ -661,18 +1130,46 @@ class _ArgUsageVisitor(ast.NodeVisitor):
     def __init__(self, tracked):
         self.tracked = set(tracked)
         self.usage = {name: set() for name in tracked}
+        self.loop_targets = {}
 
     def mark(self, name, kind):
         if name in self.usage:
             self.usage[name].add(kind)
+        if name in self.loop_targets and kind == "numeric":
+            iter_name = self.loop_targets[name]
+            if iter_name in self.usage:
+                self.usage[iter_name].add("list_numeric")
 
     def visit_BinOp(self, node: ast.BinOp):
+        if isinstance(node.op, ast.Add):
+            string_context = any(self._is_string_like(side) for side in (node.left, node.right))
+            if string_context:
+                for side in (node.left, node.right):
+                    if isinstance(side, ast.Name):
+                        self.mark(side.id, "string")
+                self.generic_visit(node)
+                return
         if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv)):
             for side in (node.left, node.right):
                 if isinstance(side, ast.Name):
                     self.mark(side.id, "numeric")
                 elif isinstance(side, ast.Subscript) and isinstance(side.value, ast.Name):
                     self.mark(side.value.id, "list_numeric")
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign):
+        if isinstance(node.op, ast.Add) and self._is_string_like(node.value):
+            if isinstance(node.target, ast.Name):
+                self.mark(node.target.id, "string")
+            self.generic_visit(node)
+            return
+        if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv)):
+            if isinstance(node.target, ast.Name):
+                self.mark(node.target.id, "numeric")
+            if isinstance(node.value, ast.Name):
+                self.mark(node.value.id, "numeric")
+            elif isinstance(node.value, ast.Subscript) and isinstance(node.value.value, ast.Name):
+                self.mark(node.value.value.id, "list_numeric")
         self.generic_visit(node)
 
     def visit_UnaryOp(self, node: ast.UnaryOp):
@@ -711,9 +1208,41 @@ class _ArgUsageVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For):
-        if isinstance(node.iter, ast.Name):
-            self.mark(node.iter.id, "list")
-        self.generic_visit(node)
+        iter_name = node.iter.id if isinstance(node.iter, ast.Name) else None
+        target_name = node.target.id if isinstance(node.target, ast.Name) else None
+        if iter_name in self.tracked and target_name:
+            prev = self.loop_targets.get(target_name)
+            self.loop_targets[target_name] = iter_name
+            self.mark(iter_name, "list")
+            if node.iter:
+                self.visit(node.iter)
+            if node.target:
+                self.visit(node.target)
+            for stmt in node.body:
+                self.visit(stmt)
+            for stmt in node.orelse:
+                self.visit(stmt)
+            if prev is None:
+                self.loop_targets.pop(target_name, None)
+            else:
+                self.loop_targets[target_name] = prev
+        else:
+            self.generic_visit(node)
+
+    def _is_string_like(self, node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        if isinstance(node, ast.JoinedStr):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "str"
+        ):
+            return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return self._is_string_like(node.left) or self._is_string_like(node.right)
+        return False
 
     def visit_FunctionDef(self, node):
         # no profundizamos en funciones anidadas
