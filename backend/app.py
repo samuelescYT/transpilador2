@@ -100,14 +100,10 @@ class PyToJava(ast.NodeVisitor):
         self.scanner_initialized[-1] = True
 
     def translate_input_call(self, node: ast.Call) -> str:
-        prompt_args = []
+        self.ensure_scanner_available()
         if node.args:
             prompt_expr = self.expr(node.args[0])
-            prompt_args.append(prompt_expr)
-        if prompt_args:
-            self.emit(f"System.out.print({prompt_args[0]});")
-            self.emit("System.out.flush();")
-        self.ensure_scanner_available()
+            self.emit(f"System.out.println({prompt_expr});")
         return "scanner.nextLine()"
 
     def declare_local_if_needed(self, name, expr_java, value_node=None):
